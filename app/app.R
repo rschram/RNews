@@ -1,5 +1,6 @@
 # app/app.R
-source("../config.R")          # Load seeds/paths
+library(here)
+source(here::here("config.R"))
 source("../R/text_utils.R")    # Highlighter
 source("../R/graph_utils.R")   # Graph Filter
 
@@ -7,6 +8,7 @@ library(shiny)
 library(visNetwork)
 library(tidyverse)
 library(igraph)
+
 
 # 1. LOAD THE WINNER (Pre-calculated in Analysis)
 # We assume 'model_current.rds' contains: 
