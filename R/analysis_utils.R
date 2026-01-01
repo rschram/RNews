@@ -528,4 +528,62 @@ perform_similarity_sweep <- function(corpus, vectors, method="embeddings_weighte
 }
 
 
+#' Calculate Vocabulary Statistics (Entropy + PageRank)
+#' @param dtm Sparse Document-Term Matrix
+#' @param similarity_threshold Cutoff for the PageRank graph (to keep it sparse)
+calc_vocab_stats <- function(dtm, similarity_threshold = 0.2) {
+  
+  # 1. ENTROPY CALCULATION (Distribution)
+  term_freqs <- Matrix::colSums(dtm)
+  inv_freq_diag <- Matrix::Diagonal(x = 1 / term_freqs)
+  P_dt <- dtm %*% inv_freq_diag
+  P_dt@x <- P_dt@x * log2(P_dt@x)
+  H_t <- -Matrix::colSums(P_dt)
+  
+  # 2. PAGERANK CALCULATION (Structure)
+  # We need a Term-Term Graph. 
+  # A. Cosine Similarity between Terms (not Docs!)
+  # Formula: T = DTM_norm' %*% DTM_norm
+  
+  # Normalize columns (Terms) to length 1
+  # (Standard L2 normalization for Cosine)
+  norm_vec <- sqrt(Matrix::colSums(dtm^2))
+  dtm_norm <- dtm %*% Matrix::Diagonal(x = 1/norm_vec)
+  
+  # Compute Term-Term Similarity Matrix (Sparse)
+  # This can be heavy for >10k terms. 
+  # Optimization: Only compute for terms appearing > X times?
+  # For now, we assume vocab < 10k or sufficient RAM.
+  term_sim <- Matrix::crossprod(dtm_norm) # t(DTM) %*% DTM
+  
+  # B. Prune weak links to make PageRank efficient/meaningful
+  # PageRank acts weird on fully connected weighted graphs (everything becomes equal).
+  term_sim[term_sim < similarity_threshold] <- 0
+  diag(term_sim) <- 0
+  
+  # C. Run PageRank
+  # 'igraph' is faster than manual power iteration in R
+  g_term <- igraph::graph_from_adjacency_matrix(term_sim, mode="undirected", weighted=TRUE)
+  pr_res <- igraph::page_rank(g_term, damping = 0.85)$vector
+  
+  # 3. COMPILE RESULTS
+  stats <- data.frame(
+    Term = names(term_freqs),
+    Frequency = as.numeric(term_freqs),
+    Entropy = as.numeric(H_t),
+    PageRank = as.numeric(pr_res)
+  ) %>%
+    filter(Frequency > 1) %>%
+    mutate(
+      Expected_Entropy = log2(Frequency),
+      Entropy_Gap = Entropy - Expected_Entropy, # High Negative = Bursty
+      
+      # Rank metrics for easier plotting
+      Rank_Gap = percent_rank(desc(Entropy_Gap)),
+      Rank_PR = percent_rank(PageRank)
+    )
+  
+  return(stats)
+}
+
 
