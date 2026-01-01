@@ -1,6 +1,10 @@
 library(igraph)
 library(tidyverse)
 library(text2vec)
+library(tidytext)
+library(Matrix)
+
+
 
 #' Ingest ProQuest Exports into SQLite (With Boilerplate Removal)
 #'
@@ -293,14 +297,207 @@ get_corpus_stats <- function(db_connection) {
   )
 }
 
-library(tidyverse)
-library(tidytext)
-library(Matrix)
-library(igraph)
 
-# ==============================================================================
-# PHASE 1: The Chassis (Input Standardization & Rank Analytics)
-# ==============================================================================
+
+
+#' Analyze Clusters (The Main Reporting Engine)
+analyze_clusters <- function(g, dtm, corpus, method = "tfidf", resolution = 1.0) {
+  
+  message(sprintf(">> Running Leiden Clustering (Resolution: %.2f)...", resolution))
+  
+  # 1. Run Leiden Algorithm
+  comm <- cluster_leiden(
+    g, 
+    objective_function = "modularity", 
+    weights = E(g)$weight,
+    resolution_parameter = resolution
+  )
+  membership <- membership(comm)
+  cluster_ids <- sort(unique(membership))
+  
+  # --- PRE-CALCULATE DISTINCTIVE TERMS ---
+  message(">> identifying distinctive terms per cluster...")
+  
+  cluster_map <- data.frame(
+    doc_id = names(membership),
+    cluster_id = as.numeric(membership),
+    stringsAsFactors = FALSE
+  )
+  
+  cluster_tokens <- corpus$tokens %>%
+    inner_join(cluster_map, by = "doc_id")
+  
+  distinctive_terms_df <- cluster_tokens %>%
+    count(cluster_id, term, name = "n") %>%
+    bind_tf_idf(term, cluster_id, n) %>%
+    group_by(cluster_id) %>%
+    arrange(desc(tf_idf)) %>%
+    slice_head(n = 10) %>%
+    summarise(
+      top_terms = paste(term, collapse = ", ")
+    )
+  
+  metrics_list <- list()
+  audit_list <- list()
+  
+  # 2. Iterate through Clusters
+  for(cid in cluster_ids) {
+    
+    # Get Members
+    member_ids <- names(membership)[membership == cid]
+    n_docs <- length(member_ids)
+    
+    # Subgraph
+    subg <- induced_subgraph(g, member_ids)
+    
+    # --- A. Topological Metrics ---
+    dens <- edge_density(subg)
+    
+    local_trans <- transitivity(subg, type = "local", vids = V(subg))
+    local_trans[is.na(local_trans)] <- 0 
+    mean_trans <- mean(local_trans)
+    sd_trans <- sd(local_trans)
+    
+    if (n_docs > 1) {
+      paths <- distance_table(subg)$res
+      if (length(paths) > 0) {
+        raw_paths <- rep(seq_along(paths), times = paths)
+        mean_path <- mean(raw_paths)
+        sd_path <- sd(raw_paths)
+      } else { mean_path <- 0; sd_path <- 0 }
+    } else { mean_path <- 0; sd_path <- 0 }
+    
+    vol <- sum(strength(g, vids = member_ids))
+    cut <- vol - (2 * sum(E(subg)$weight)) 
+    cond <- if(vol > 0) cut / vol else 0
+    
+    # --- B. Vector Metrics ---
+    sub_dtm <- dtm[member_ids, , drop=FALSE]
+    
+    if (method %in% c("binary", "jaccard")) {
+      # Jaccard Logic
+      m_bin <- as.matrix(sub_dtm)
+      m_bin[m_bin > 0] <- 1
+      inter <- m_bin %*% t(m_bin)
+      sz <- diag(inter)
+      union_mat <- outer(sz, sz, "+") - inter
+      sim_mat <- inter / union_mat
+      sim_mat[is.nan(sim_mat)] <- 0
+      
+      avg_sims <- rowMeans(sim_mat)
+      medoid_idx <- which.max(avg_sims)
+      centroid_ref <- names(avg_sims)[medoid_idx]
+      centrality_scores <- sim_mat[, medoid_idx]
+    } else {
+      # Vector Logic
+      centroid_vec <- colMeans(sub_dtm)
+      centrality_scores <- text2vec::sim2(sub_dtm, matrix(centroid_vec, nrow=1), method = "cosine")[,1]
+      centroid_ref <- "Mathematical Mean"
+    }
+    
+    # --- C. Retrieve Top Terms ---
+    term_str <- distinctive_terms_df$top_terms[distinctive_terms_df$cluster_id == cid]
+    if(length(term_str) == 0) term_str <- "N/A"
+    
+    # --- D. Compile Data ---
+    headlines <- corpus$meta$headline[match(member_ids, corpus$meta$doc_id)]
+    
+    cluster_audit <- data.frame(
+      doc_id = member_ids,
+      cluster_id = cid,
+      headline = headlines,
+      centrality = as.numeric(centrality_scores),
+      stringsAsFactors = FALSE
+    )
+    audit_list[[cid]] <- cluster_audit
+    
+    metrics_list[[cid]] <- data.frame(
+      cluster_id = cid,
+      n_docs = n_docs,
+      density = dens,
+      conductance = cond,
+      mean_trans = mean_trans,
+      sd_trans = sd_trans,
+      mean_path = mean_path,
+      sd_path = sd_path,
+      mean_centrality = mean(centrality_scores),
+      sd_centrality = sd(centrality_scores),
+      top_terms = term_str,
+      centroid_ref = centroid_ref
+    )
+  }
+  
+  metrics_df <- bind_rows(metrics_list)
+  audit_df <- bind_rows(audit_list) %>% arrange(cluster_id, desc(centrality))
+  
+  return(list(metrics = metrics_df, audit = audit_df))
+}
+
+#' Generate Full Test Bench Report
+run_test_bench <- function(corpus, method = "tfidf", threshold = 0.2, 
+                           bm25_k = 1.2, bm25_b = 1.0, boot_iter = 30,
+                           resolution = 1.0, vectors = NULL) {
+  
+  message(sprintf("\n=== RUNNING TEST BENCH: %s (Thresh: %.2f) ===", toupper(method), threshold))
+  
+  # 1. Phase 2: Generate Matrix & Sim
+  if (method == "embeddings_weighted") {
+    if(is.null(vectors)) stop("Missing 'vectors' argument.")
+    valid_terms <- intersect(rownames(vectors), corpus$term_stats$term)
+    subset_vecs <- vectors[valid_terms, ]
+    
+    message(">> Calculating Weighted Document Vectors...")
+    dtm <- get_weighted_document_vectors(corpus$tokens, subset_vecs)
+    sim <- text2vec::sim2(dtm, method = "cosine", norm = "l2")
+    
+  } else if (method == "embeddings_mean") {
+    if(is.null(vectors)) stop("Missing 'vectors' argument.")
+    valid_terms <- intersect(rownames(vectors), corpus$term_stats$term)
+    subset_vecs <- vectors[valid_terms, ]
+    
+    message(">> Calculating Mean Document Vectors...")
+    dtm <- get_mean_document_vectors(corpus$tokens, subset_vecs)
+    sim <- text2vec::sim2(dtm, method = "cosine", norm = "l2")
+    
+  } else {
+    # Sparse Methods
+    dtm <- get_document_matrix(corpus, method = method, k = bm25_k, b = bm25_b)
+    
+    # <--- FIXED: Correctly logic for Jaccard vs Cosine
+    sim_type <- ifelse(method %in% c("binary", "jaccard"), "jaccard", "cosine")
+    sim <- compute_similarity(dtm, method = sim_type)
+  }
+  
+  # 2. Phase 3: Bootstrap Topology
+  message(sprintf(">> Step A: Bootstrapping Global Topology (%d iters)...", boot_iter))
+  
+  boot_res <- bootstrap_topology(
+    corpus, 
+    method = method, 
+    threshold = threshold, 
+    n_iter = boot_iter, 
+    vectors = vectors
+  )
+  
+  # 3. Phase 3b: Build Single Graph
+  g <- build_graph(sim, threshold)
+  
+  # 4. Phase 4: Clustering
+  message(">> Step B: Analyzing Clusters...")
+  cluster_res <- analyze_clusters(g, dtm, corpus, method = method, resolution = resolution)
+  
+  message(sprintf(">> COMPLETE. Graph has %d clusters.", nrow(cluster_res$metrics)))
+  
+  return(list(
+    global = boot_res$summary,
+    clusters = cluster_res$metrics,
+    audit = cluster_res$audit,
+    graph = g
+  ))
+}
+
+
+
 
 #' Create Standardized Corpus Object
 #'
@@ -404,9 +601,71 @@ plot_rank_curves <- function(curve_data) {
 }
 
 
-# ==============================================================================
-# 1. MODEL SUITE WRAPPER (Step 1)
-# ==============================================================================
+#' Generate Full Test Bench Report
+run_test_bench <- function(corpus, method = "tfidf", threshold = 0.2, 
+                           bm25_k = 1.2, bm25_b = 1.0, boot_iter = 30,
+                           resolution = 1.0, vectors = NULL) {
+  
+  message(sprintf("\n=== RUNNING TEST BENCH: %s (Thresh: %.2f) ===", toupper(method), threshold))
+  
+  # 1. Phase 2: Generate Matrix & Sim
+  if (method == "embeddings_weighted") {
+    if(is.null(vectors)) stop("Missing 'vectors' argument.")
+    valid_terms <- intersect(rownames(vectors), corpus$term_stats$term)
+    subset_vecs <- vectors[valid_terms, ]
+    
+    message(">> Calculating Weighted Document Vectors...")
+    dtm <- get_weighted_document_vectors(corpus$tokens, subset_vecs)
+    sim <- text2vec::sim2(dtm, method = "cosine", norm = "l2")
+    
+  } else if (method == "embeddings_mean") {
+    if(is.null(vectors)) stop("Missing 'vectors' argument.")
+    valid_terms <- intersect(rownames(vectors), corpus$term_stats$term)
+    subset_vecs <- vectors[valid_terms, ]
+    
+    message(">> Calculating Mean Document Vectors...")
+    dtm <- get_mean_document_vectors(corpus$tokens, subset_vecs)
+    sim <- text2vec::sim2(dtm, method = "cosine", norm = "l2")
+    
+  } else {
+    # Sparse Methods
+    dtm <- get_document_matrix(corpus, method = method, k = bm25_k, b = bm25_b)
+    
+    # <--- FIXED: Correctly logic for Jaccard vs Cosine
+    sim_type <- ifelse(method %in% c("binary", "jaccard"), "jaccard", "cosine")
+    sim <- compute_similarity(dtm, method = sim_type)
+  }
+  
+  # 2. Phase 3: Bootstrap Topology
+  message(sprintf(">> Step A: Bootstrapping Global Topology (%d iters)...", boot_iter))
+  
+  boot_res <- bootstrap_topology(
+    corpus, 
+    method = method, 
+    threshold = threshold, 
+    n_iter = boot_iter, 
+    vectors = vectors
+  )
+  
+  # 3. Phase 3b: Build Single Graph
+  g <- build_graph(sim, threshold)
+  
+  # 4. Phase 4: Clustering
+  message(">> Step B: Analyzing Clusters...")
+  cluster_res <- analyze_clusters(g, dtm, corpus, method = method, resolution = resolution)
+  
+  message(sprintf(">> COMPLETE. Graph has %d clusters.", nrow(cluster_res$metrics)))
+  
+  return(list(
+    global = boot_res$summary,
+    clusters = cluster_res$metrics,
+    audit = cluster_res$audit,
+    graph = g
+  ))
+}
+
+
+
 run_model_suite <- function(corpus, vectors = NULL, threshold = 0.3, boot_iter = 50) {
   
   message(sprintf("\n>> RUNNING MODEL SUITE (Threshold: %.2f, Boot: %d)...", threshold, boot_iter))
@@ -455,76 +714,6 @@ run_model_suite <- function(corpus, vectors = NULL, threshold = 0.3, boot_iter =
     results = suite_results,
     comparison = comparison_table
   ))
-}
-
-
-# ==============================================================================
-# 3. SIMILARITY SWEEP (Step 3)
-# ==============================================================================
-perform_similarity_sweep <- function(corpus, vectors, method="embeddings_weighted", range=seq(0.1, 0.9, 0.05)) {
-  
-  message(sprintf("\n>> STARTING PHASE SWEEP (%s)...", method))
-  
-  # Pre-calculate Sim Matrix (Optimization)
-  dtm <- get_weighted_document_vectors(corpus$tokens, vectors)
-  sim_matrix <- text2vec::sim2(dtm, method = "cosine", norm = "l2")
-  
-  results_list <- list()
-  total_docs <- nrow(corpus$meta)
-  
-  for (t in range) {
-    # progress check
-    if (which(range == t) %% 5 == 0) message(sprintf("   ...processing threshold %.2f", t))
-    
-    # 1. Build Graph
-    adj <- sim_matrix
-    adj[adj < t] <- 0
-    g <- graph_from_adjacency_matrix(adj, mode = "max", weighted = TRUE, diag = FALSE)
-    
-    # 2. Basic Metrics
-    comps <- components(g)
-    gcr <- max(comps$csize) / total_docs
-    survivors <- sum(degree(g) > 0) / total_docs
-    
-    # 3. Structure (Modularity)
-    leiden <- cluster_leiden(g, objective_function = "modularity", weights = E(g)$weight, resolution_parameter = 1.0)
-    mod <- modularity(g, membership(leiden), weights = E(g)$weight)
-    n_clus <- length(unique(membership(leiden)))
-    
-    # 4. Advanced Topology (Transitivity / Assortativity)
-    trans <- transitivity(g, type = "global")
-    assort <- assortativity_degree(g)
-    
-    # 5. Stress Metrics (On Giant Component Only)
-    giant_nodes <- names(comps$membership[comps$membership == which.max(comps$csize)])
-    
-    if (length(giant_nodes) > 2) {
-      g_giant <- induced_subgraph(g, giant_nodes)
-      avg_path <- mean_distance(g_giant, directed = FALSE)
-      
-      # Betweenness (Normalized)
-      betw <- betweenness(g_giant, normalized = TRUE)
-      avg_betw <- mean(betw)
-      max_betw <- max(betw)
-    } else {
-      avg_path <- 0; avg_betw <- 0; max_betw <- 0
-    }
-    
-    results_list[[as.character(t)]] <- data.frame(
-      Threshold = t,
-      GCR = gcr,
-      Modularity = mod,
-      Survivors = survivors,
-      Avg_Path = avg_path,
-      Avg_Betweenness = avg_betw,
-      Max_Betweenness = max_betw,
-      Transitivity = trans,
-      Assortativity = assort,
-      N_Clusters = n_clus
-    )
-  }
-  
-  return(bind_rows(results_list))
 }
 
 
