@@ -1,0 +1,225 @@
+---
+title: "Paper template"
+author: "Research Team"
+format: 
+  html:
+    toc: true
+    code-fold: true
+    df-print: kable
+editor: source
+---
+
+## 1. Environment Setup
+
+We initialize the project environment using the rigorous path controls defined in `config.R`.
+
+```{r setup, message=FALSE, warning=FALSE}
+# 1. Load Project Configuration (The Source of Truth)
+library(here)
+source(here::here("config.R"))
+
+# 2. Load Local Function Library
+# We use the source_lib helper from config.R to ensure paths are correct
+source_lib("analysis_utils.R")
+source_lib("vectors.R")
+source_lib("topologies.R")
+source_lib("matrix.R")
+source_lib("graph_utils.R")
+source_lib("text_utils.R")
+
+# 3. Libraries
+library(tidyverse)
+library(DBI)
+library(RSQLite)
+library(gt) # For nice tables
+```
+
+```{r}
+DB_PATH <- file.path(PATH_PROC, "corpus.db")
+
+corpus_name <- db_path
+
+# 1. Define the Loader Function (Custom for this analysis)
+load_corpus_from_sqlite <- function(db_path) {
+  con <- dbConnect(SQLite(), db_path)
+  on.exit(dbDisconnect(con))
+  
+  # A. Get Metadata
+  # Modify this query if you need to filter specific dates/authors
+  meta_df <- dbGetQuery(con, "SELECT doc_id, headline, date, author FROM doc_index") %>%
+    as_tibble()
+  
+  # B. Get Token Counts
+  # We join with doc_index to ensure we only get tokens for the filtered docs
+  tokens_df <- dbGetQuery(con, "
+    SELECT t.doc_id, t.term, t.n 
+    FROM token_index t
+    INNER JOIN doc_index d ON t.doc_id = d.doc_id
+  ") %>%
+    as_tibble()
+  
+  # C. Get Full Text (Optional, needed for App export later)
+  content_df <- dbGetQuery(con, "SELECT doc_id, full_text FROM doc_content") %>%
+    as_tibble()
+  
+  list(meta = meta_df, tokens = tokens_df, content = content_df)
+}
+
+# 2. Execute Load
+if(file.exists(DB_PATH)) {
+  raw_data <- load_corpus_from_sqlite(DB_PATH)
+  
+  # 3. Create Standard Corpus Object
+  # This calculates Global TF, IDF, and stats immediately
+  corpus <- create_corpus_object(raw_data$tokens, raw_data$meta)
+  
+  message(sprintf("Loaded Corpus: %d documents, %d unique terms.", 
+                  corpus$stats$n_docs, corpus$stats$n_terms))
+} else {
+  stop("Database not found! Please run ingestion.")
+}
+```
+
+# Corpus stats
+
+```{r}
+
+print(corpus_name)
+
+print("N docs:", corpus$stats$n_docs)
+
+print("Total tokens:", corpus$stats$total_tokens)
+
+print("Average doc length:", corpus$stats$avg_doc_len)
+
+print("N unique terms:", corpus$stats$n_terms)
+
+```
+
+# Rank curves
+
+```{r}
+# Calculate Rank-Order Distributions (Zipf, TF-IDF Mass, BM25)
+rank_data <- analyze_rank_curves(corpus)
+
+# Plot
+plot_rank_curves(rank_data)
+```
+
+# Term embeddings 
+
+```{r}
+# Parameters
+MIN_COUNT   <- 5   # Ignore words appearing < 5 times
+WINDOW_SIZE <- 10  # Context window
+RANK        <- 50  # Dimensions (SVD Rank)
+
+# Generate (or Load if cached)
+VECTOR_PATH <- file.path(PATH_PROC, "vectors.rds")
+
+if(file.exists(VECTOR_PATH)) {
+  message(">> Loading cached vectors...")
+  vectors_obj <- readRDS(VECTOR_PATH)
+} else {
+  message(">> Generating new vectors...")
+  # We need the full text for sliding windows. 
+  # Ideally, we should pass the full text data frame here.
+  vectors_obj <- generate_corpus_vectors(
+    text_df = raw_data$content %>% rename(text = full_text),
+    min_count = MIN_COUNT,
+    window_size = WINDOW_SIZE,
+    rank = RANK
+  )
+  saveRDS(vectors_obj, VECTOR_PATH)
+}
+
+# Extract the matrix for the test bench
+word_vectors <- vectors_obj$vectors
+```
+
+# Model comparison
+
+```{r}
+# Run the Suite (This calls run_test_bench -> bootstrap_topology)
+# boot_iter = 30 is good for testing, increase to 100 for final paper
+suite_results <- run_model_suite(
+  corpus = corpus, 
+  vectors = word_vectors, 
+  threshold = SIM_THRESHOLD, # Defined in config.R (e.g., 0.3)
+  boot_iter = 30 
+)
+
+# Show the Comparison Table
+suite_results$comparison %>%
+  select(Method, gcr_mean, modularity_mean, survivors_mean, transitivity_mean) %>%
+  gt() %>%
+  fmt_number(decimals = 3) %>%
+  tab_header(title = "Model Stability Comparison (Bootstrapped)")
+```
+
+
+## Comparison plots
+
+```{r}
+# Helper to plot GCR vs Modularity (The Trade-off)
+suite_results$comparison %>%
+  ggplot(aes(x = gcr_mean, y = modularity_mean, label = Method, color = Method)) +
+  geom_point(size = 5) +
+  geom_text(vjust = -1) +
+  geom_errorbarh(aes(xmin = gcr_ci_low, xmax = gcr_ci_high), height = 0) +
+  geom_errorbar(aes(ymin = modularity_ci_low, ymax = modularity_ci_high), width = 0) +
+  labs(
+    title = "The Stability Trade-off",
+    subtitle = "Top Right is better (High Structure + High Connectivity)",
+    x = "Giant Component Ratio (Connectivity)",
+    y = "Modularity (Distinctness)"
+  ) +
+  theme_minimal() +
+  expand_limits(x = c(0, 1), y = c(0, 1))
+```
+
+# Selection of best model for analysis 
+
+```{r}
+# --- DECISION POINT ---
+# Change this string to the name of the winning model from suite_results
+# Options: "TF-IDF", "BM25", "Jaccard", "Embeddings (Wgt)"
+CHOSEN_MODEL <- "Embeddings (Wgt)" 
+
+message(paste(">> Selecting Winner:", CHOSEN_MODEL))
+
+# 1. Retrieve the Winner's Data
+winner <- suite_results$results[[CHOSEN_MODEL]]
+
+# 2. Calculate Vocabulary Stats (Entropy/Burstiness) for the App
+# We calculate this now so the App doesn't have to.
+message(">> Calculating Entropy & Burstiness Metrics...")
+
+# We need a DTM to calc entropy. 
+# If Embeddings won, we use their dense matrix? 
+# NO. Entropy is calculated on the sparse counts (Distribution), regardless of the sim model.
+# So we use the raw sparse DTM from the corpus.
+sparse_dtm <- get_document_matrix(corpus, method = "tfidf") # Used for searching/entropy
+vocab_stats <- calc_vocab_stats(sparse_dtm)
+
+# 3. Package for App
+app_data <- list(
+  # The Graph (Topology)
+  graph = winner$graph,
+  
+  # The Data (Sparse DTM for Search & Fruit Salad)
+  dtm = sparse_dtm,
+  
+  # The Metrics (For Filtering)
+  stats = vocab_stats,
+  
+  # The Content (For Reading)
+  full_text = setNames(raw_data$content$full_text, raw_data$content$doc_id)
+)
+
+# 4. Save
+outfile <- file.path(PATH_APP, "model_current.rds")
+saveRDS(app_data, outfile)
+
+message(sprintf(">> SUCCESS. Production model saved to: %s", outfile))
+```

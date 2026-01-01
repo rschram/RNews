@@ -498,7 +498,6 @@ run_test_bench <- function(corpus, method = "tfidf", threshold = 0.2,
 
 
 
-
 #' Create Standardized Corpus Object
 #'
 #' Decouples cleaning from analysis. Expects clean inputs.
@@ -598,70 +597,6 @@ plot_rank_curves <- function(curve_data) {
       x = "Log Rank",
       y = "Log Score"
     )
-}
-
-
-#' Generate Full Test Bench Report
-run_test_bench <- function(corpus, method = "tfidf", threshold = 0.2, 
-                           bm25_k = 1.2, bm25_b = 1.0, boot_iter = 30,
-                           resolution = 1.0, vectors = NULL) {
-  
-  message(sprintf("\n=== RUNNING TEST BENCH: %s (Thresh: %.2f) ===", toupper(method), threshold))
-  
-  # 1. Phase 2: Generate Matrix & Sim
-  if (method == "embeddings_weighted") {
-    if(is.null(vectors)) stop("Missing 'vectors' argument.")
-    valid_terms <- intersect(rownames(vectors), corpus$term_stats$term)
-    subset_vecs <- vectors[valid_terms, ]
-    
-    message(">> Calculating Weighted Document Vectors...")
-    dtm <- get_weighted_document_vectors(corpus$tokens, subset_vecs)
-    sim <- text2vec::sim2(dtm, method = "cosine", norm = "l2")
-    
-  } else if (method == "embeddings_mean") {
-    if(is.null(vectors)) stop("Missing 'vectors' argument.")
-    valid_terms <- intersect(rownames(vectors), corpus$term_stats$term)
-    subset_vecs <- vectors[valid_terms, ]
-    
-    message(">> Calculating Mean Document Vectors...")
-    dtm <- get_mean_document_vectors(corpus$tokens, subset_vecs)
-    sim <- text2vec::sim2(dtm, method = "cosine", norm = "l2")
-    
-  } else {
-    # Sparse Methods
-    dtm <- get_document_matrix(corpus, method = method, k = bm25_k, b = bm25_b)
-    
-    # <--- FIXED: Correctly logic for Jaccard vs Cosine
-    sim_type <- ifelse(method %in% c("binary", "jaccard"), "jaccard", "cosine")
-    sim <- compute_similarity(dtm, method = sim_type)
-  }
-  
-  # 2. Phase 3: Bootstrap Topology
-  message(sprintf(">> Step A: Bootstrapping Global Topology (%d iters)...", boot_iter))
-  
-  boot_res <- bootstrap_topology(
-    corpus, 
-    method = method, 
-    threshold = threshold, 
-    n_iter = boot_iter, 
-    vectors = vectors
-  )
-  
-  # 3. Phase 3b: Build Single Graph
-  g <- build_graph(sim, threshold)
-  
-  # 4. Phase 4: Clustering
-  message(">> Step B: Analyzing Clusters...")
-  cluster_res <- analyze_clusters(g, dtm, corpus, method = method, resolution = resolution)
-  
-  message(sprintf(">> COMPLETE. Graph has %d clusters.", nrow(cluster_res$metrics)))
-  
-  return(list(
-    global = boot_res$summary,
-    clusters = cluster_res$metrics,
-    audit = cluster_res$audit,
-    graph = g
-  ))
 }
 
 
