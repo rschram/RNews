@@ -7,6 +7,9 @@ format:
     code-fold: true
     df-print: kable
 editor: source
+execute: 
+  warning: false
+  message: false
 ---
 
 ## 1. Environment Setup
@@ -34,10 +37,10 @@ library(RSQLite)
 library(gt) # For nice tables
 ```
 
-```{r}
-DB_PATH <- file.path(PATH_PROC, "corpus.db")
+```{r, warning=FALSE, message=FALSE}
+DB_PATH <- file.path(PATH_PROC, "corpus_fiji_2005.sqlite")
 
-corpus_name <- db_path
+corpus_name <- "Test run"
 
 # 1. Define the Loader Function (Custom for this analysis)
 load_corpus_from_sqlite <- function(db_path) {
@@ -82,19 +85,7 @@ if(file.exists(DB_PATH)) {
 
 # Corpus stats
 
-```{r}
-
-print(corpus_name)
-
-print("N docs:", corpus$stats$n_docs)
-
-print("Total tokens:", corpus$stats$total_tokens)
-
-print("Average doc length:", corpus$stats$avg_doc_len)
-
-print("N unique terms:", corpus$stats$n_terms)
-
-```
+The corpus *`r basename(corpus_name)`* contains **`r scales::comma(corpus$stats$n_docs)`** documents and a total of **`r scales::comma(corpus$stats$n_tokens)`** tokens. The average document length is `r round(corpus$stats$avg_doc_len, 2)` words.
 
 # Rank curves
 
@@ -146,37 +137,172 @@ suite_results <- run_model_suite(
   corpus = corpus, 
   vectors = word_vectors, 
   threshold = SIM_THRESHOLD, # Defined in config.R (e.g., 0.3)
-  boot_iter = 30 
+  boot_iter = 1
 )
 
 # Show the Comparison Table
 suite_results$comparison %>%
-  select(Method, gcr_mean, modularity_mean, survivors_mean, transitivity_mean) %>%
+  # 1. Select the relevant statistics
+  select(Method, ends_with("_mean"), ends_with("_ci_low"), ends_with("_ci_high")) %>%
+  
+  # 2. Pivot longer to handle all metrics dynamically
+  pivot_longer(
+    cols = -Method, 
+    names_to = c("metric", "stat"), 
+    names_pattern = "^(.*)_(mean|ci_low|ci_high)$"
+  ) %>%
+  
+  # 3. Pivot wider to align Mean, Low, and High for calculation
+  pivot_wider(names_from = stat, values_from = value) %>%
+  
+  # 4. Calculate Margin and Identify the "Best" (Narrowest CI)
+  mutate(
+    margin = (ci_high - ci_low) / 2
+  ) %>%
+  group_by(metric) %>%
+  mutate(
+    is_best_ci = margin == min(margin) # Find smallest margin in this group
+  ) %>%
+  ungroup() %>%
+
+  # 5. Create the combined display string: "Mean ± Margin"
+  mutate(
+    # If best: Bold text, Black color. If not: Normal text, Grey color.
+    ci_style_open = ifelse(is_best_ci, "<span style='font-weight:bold; color:#000;'>", "<span style='color:#666;'>"),
+    
+    display_value = sprintf("%.3f <br><span style='font-size:0.8em;'>%s± %.3f</span></span>", 
+                            mean, ci_style_open, margin)
+  ) %>%
+  
+  # 6. Clean up metric names
+  mutate(metric = str_to_title(str_replace_all(metric, "_", " "))) %>%
+  
+  # 7. Pivot back to wide format for the final table
+  select(Method, metric, display_value) %>%
+  pivot_wider(names_from = metric, values_from = display_value) %>%
+  
+  # 8. Render with GT
   gt() %>%
-  fmt_number(decimals = 3) %>%
-  tab_header(title = "Model Stability Comparison (Bootstrapped)")
+  fmt_markdown(columns = -Method) %>% 
+  tab_header(
+    title = "Model Stability Comparison (Bootstrapped)",
+    subtitle = "Values shown as: Mean ± Margin of Error (95% CI)"
+  ) %>%
+  cols_align(align = "center", columns = -Method) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) %>%
+  tab_footnote(
+    footnote = "Bold values indicate the most stable model (narrowest CI) for that metric."
+  )
+
 ```
 
 
 ## Comparison plots
 
 ```{r}
+library(ggrepel) # Add this to your setup chunk if not present
+
 # Helper to plot GCR vs Modularity (The Trade-off)
 suite_results$comparison %>%
-  ggplot(aes(x = gcr_mean, y = modularity_mean, label = Method, color = Method)) +
-  geom_point(size = 5) +
-  geom_text(vjust = -1) +
-  geom_errorbarh(aes(xmin = gcr_ci_low, xmax = gcr_ci_high), height = 0) +
-  geom_errorbar(aes(ymin = modularity_ci_low, ymax = modularity_ci_high), width = 0) +
+  ggplot(aes(x = gcr_mean, y = modularity_mean, color = Method)) +
+  
+  # 1. Error Bars (Thicker and clearer)
+  # Vertical Error Bars (Variation in Modularity)
+  geom_errorbar(aes(ymin = modularity_ci_low, ymax = modularity_ci_high), 
+                width = 0.02, linewidth = 0.8, alpha = 0.6) +
+  
+  # Horizontal Error Bars (Variation in GCR)
+  # We replace geom_errorbarh with standard geom_errorbar mapping xmin/xmax
+  geom_errorbar(aes(xmin = gcr_ci_low, xmax = gcr_ci_high), 
+                width = 0.02, linewidth = 0.8, alpha = 0.6) +
+  
+  # 2. Points (On top of bars)
+  geom_point(size = 2) +
+  
+  # 3. Labels (Fixed "a" in legend and cutoff issues)
+  geom_text_repel(
+    aes(label = Method),
+    show.legend = FALSE,      # Removes "a" from legend
+    box.padding = 0.5,        # Space around text
+    point.padding = 0.5,      # Space away from dots
+    min.segment.length = 0,   # Always draw lines if pushed far away
+    max.overlaps = Inf
+  ) +
+  
   labs(
     title = "The Stability Trade-off",
     subtitle = "Top Right is better (High Structure + High Connectivity)",
     x = "Giant Component Ratio (Connectivity)",
     y = "Modularity (Distinctness)"
   ) +
+  
   theme_minimal() +
-  expand_limits(x = c(0, 1), y = c(0, 1))
+  
+  # 4. Expand limits slightly more to give breathing room
+  scale_x_continuous(limits = c(0, 1.1), expand = expansion(mult = 0.1)) +
+  scale_y_continuous(limits = c(0, 1.1), expand = expansion(mult = 0.1))
 ```
+
+# The percolation event
+
+```{r}
+### 6. Phase Transition Analysis (The "Sweep")
+
+# A. Calculate the Sweep Data
+# We use the parameters from your "winning" model choice.
+# Ensure 'vectors' are loaded if using an embedding method.
+sweep_results <- perform_similarity_sweep(
+  corpus = corpus,
+  vectors = word_vectors, 
+  method = "embeddings_mean", # CHANGE THIS to match your winning method code (e.g. "tfidf", "bm25")
+  thresholds = seq(0.05, 1, 0.05)
+)
+
+# B. Plot the Phase Transition
+# We need to scale the "Cluster Count" to fit on the 0-1 axis for visualization,
+# then add a secondary axis labels to show the true count.
+scale_factor <- max(sweep_results$Cluster_Count, na.rm=TRUE)
+
+ggplot(sweep_results, aes(x = Threshold)) +
+  
+  # 1. Global Metrics (Solid Lines)
+  geom_line(aes(y = GCR, color = "Giant Component Ratio (GCR)"), size = 1) +
+  geom_line(aes(y = Modularity, color = "Modularity"), size = 1) +
+  geom_line(aes(y = Avg_Betweenness, color = "Structural stress (Average betweenness)"), size = 1) +
+  geom_line(aes(y = Max_Betweenness, color = "Bridge strength (Maximum betweenness)"), size = 1) +
+  
+  # 2. Survivors (Dashed Line)
+  geom_line(aes(y = Survivor_Pct, color = "Survivors (%)"), linetype = "dashed", size = 1) +
+  
+  # 3. Cluster Count (Dotted Line, Scaled)
+  geom_line(aes(y = Cluster_Count / scale_factor, color = "Cluster count"), linetype = "dotted", size = 1.2) +
+  
+  # 4. Axes & Scales
+  scale_y_continuous(
+    name = "Normalized Metrics (0-1)",
+    limits = c(0, 1),
+    # Add secondary axis for the raw cluster count
+    sec.axis = sec_axis(~ . * scale_factor, name = "Number of Clusters (Dotted)")
+  ) +
+  
+  # 5. Styling
+  scale_color_brewer(palette = "Set1") +
+  theme_minimal() +
+  labs(
+    title = "Network Phase Transition Sweep",
+    subtitle = "Solid = Structure; Dashed = Survivors; Dotted = Cluster count",
+    x = "Similarity Threshold",
+    color = "Metric"
+  ) +
+  theme(legend.position = "bottom")
+```
+
+
+
+
 
 # Selection of best model for analysis 
 
@@ -184,42 +310,127 @@ suite_results$comparison %>%
 # --- DECISION POINT ---
 # Change this string to the name of the winning model from suite_results
 # Options: "TF-IDF", "BM25", "Jaccard", "Embeddings (Wgt)"
-CHOSEN_MODEL <- "Embeddings (Wgt)" 
+CHOSEN_MODEL <- "Embeddings (mean)" 
 
 message(paste(">> Selecting Winner:", CHOSEN_MODEL))
 
 # 1. Retrieve the Winner's Data
 winner <- suite_results$results[[CHOSEN_MODEL]]
 
-# 2. Calculate Vocabulary Stats (Entropy/Burstiness) for the App
-# We calculate this now so the App doesn't have to.
-message(">> Calculating Entropy & Burstiness Metrics...")
+### 7. Cluster Intelligence Report
 
-# We need a DTM to calc entropy. 
-# If Embeddings won, we use their dense matrix? 
-# NO. Entropy is calculated on the sparse counts (Distribution), regardless of the sim model.
-# So we use the raw sparse DTM from the corpus.
-sparse_dtm <- get_document_matrix(corpus, method = "tfidf") # Used for searching/entropy
-vocab_stats <- calc_vocab_stats(sparse_dtm)
+# We inspect the specific semantic communities detected by the winning model.
+# This confirms if the mathematical "clusters" actually correspond to intelligible topics.
 
-# 3. Package for App
+winner$clusters %>%
+  # 1. Select Key Metrics
+  select(cluster_id, n_docs, density, conductance, mean_centrality, top_terms) %>%
+  
+  # 2. Sort by Size (Largest Topics First)
+  # arrange(desc(n_docs)) %>%
+  
+  # 3. Optional: Filter out tiny clusters (noise) if there are too many
+  filter(n_docs > 2) %>% 
+  
+  # 4. Create Table
+  gt() %>%
+  
+  # 5. Label Columns for Humans
+  cols_label(
+    cluster_id = "ID",
+    n_docs = "Size",
+    density = "Density",
+    conductance = "Conductance",
+    mean_centrality = "Cohesion",
+    top_terms = "Distinctive terms (TF-IDF)"
+  ) %>%
+  
+  # 6. Formatting
+  fmt_number(
+    columns = c(density, conductance, mean_centrality),
+    decimals = 3
+  ) %>%
+  
+  # 7. Styling
+  tab_header(
+    title = paste("Clusters ", CHOSEN_MODEL),
+    subtitle = "Semantic communities ordered by size. 'Distinctive terms' derived via localized TF-IDF."
+  ) %>%
+  
+  # Make the terms column smaller so it doesn't dominate the width
+  tab_style(
+    style = cell_text(size = "small", style = "italic"),
+    locations = cells_body(columns = top_terms)
+  ) %>%
+  
+  # Add tooltips/footnotes for the metrics
+  tab_footnote(
+    footnote = "Density: Ratio of actual connections to potential connections (Higher = tighter topic).",
+    locations = cells_column_labels(columns = density)
+  ) %>%
+  tab_footnote(
+    footnote = "Conductance: Ratio of external links to internal volume (Lower = more distinct/isolated).",
+    locations = cells_column_labels(columns = conductance)
+  )
+```
+
+```{r}
+# 2. Calculate Vocabulary Stats (Residual Entropy Model)
+message(">> Calculating Vocabulary Stats with Residual Entropy Gap...")
+
+# We generate the DTM. 
+# Note: We use TF-IDF because it is useful for the App's search relevance later.
+# For Entropy, the IDF constant cancels out during normalization, so this is mathematically safe.
+sparse_dtm <- get_document_matrix(corpus, method = "tfidf") 
+
+# A. Basic Stats (Frequency & Raw Entropy)
+# ColSums on a sparse matrix is very fast and memory-efficient
+term_freqs <- Matrix::colSums(sparse_dtm)
+
+# Normalize columns to sum to 1 (Probabilities)
+# Multiplying by a Diagonal matrix is sparse-safe (O(N) complexity)
+inv_freq_diag <- Matrix::Diagonal(x = 1 / term_freqs)
+P_dt <- sparse_dtm %*% inv_freq_diag
+
+# Calculate Entropy in-place on the non-zero elements
+P_dt@x <- P_dt@x * log2(P_dt@x)
+H_t <- -Matrix::colSums(P_dt)
+
+vocab_stats <- data.frame(
+  Term = names(term_freqs),
+  Frequency = as.numeric(term_freqs),
+  Entropy = as.numeric(H_t)
+) %>%
+  filter(Frequency > 1) 
+
+# B. The Residual Model (The "Null Line")
+# We predict what the entropy SHOULD be for a word of this frequency.
+model_null <- lm(Entropy ~ poly(log10(Frequency), 3), data = vocab_stats)
+
+vocab_stats <- vocab_stats %>%
+  mutate(
+    Expected_Entropy = predict(model_null, .),
+    Residual = Entropy - Expected_Entropy,
+    
+    # Classify based on the Gap
+    # Residual < 0: Less random than expected (Bursty)
+    # Residual > 0: More random than expected (Generic)
+    Type = case_when(
+      Residual < -0.5 ~ "Bursty (High Info)",
+      Residual > 0.5 ~ "Generic (Low Info)",
+      TRUE ~ "Normal (Expected)"
+    )
+  )
+
+# C. Package & Save
 app_data <- list(
-  # The Graph (Topology)
+  model_name = CHOSEN_MODEL,
   graph = winner$graph,
-  
-  # The Data (Sparse DTM for Search & Fruit Salad)
   dtm = sparse_dtm,
-  
-  # The Metrics (For Filtering)
   stats = vocab_stats,
-  
-  # The Content (For Reading)
   full_text = setNames(raw_data$content$full_text, raw_data$content$doc_id)
 )
 
-# 4. Save
-outfile <- file.path(PATH_APP, "model_current.rds")
-saveRDS(app_data, outfile)
-
-message(sprintf(">> SUCCESS. Production model saved to: %s", outfile))
+saveRDS(app_data, file.path(PATH_APP, "model_current.rds"))
+message(">> SUCCESS. Model saved with Entropy Residuals.")
 ```

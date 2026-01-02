@@ -1,0 +1,219 @@
+---
+title: "RNews dashboard"
+format: 
+  html:
+    page-layout: full
+server: shiny
+---
+
+```{r setup}
+#| context: setup
+#| include: false
+
+# 1. Load Project Environment
+library(here)
+# Ensure config.R actually defines 'source_lib'. 
+# If not, replace source_lib(...) with source(here("R", "filename.R"))
+source(here::here("config.R")) 
+
+# 2. Load Function Libraries
+source(here::here("R", "text_utils.R"))  # Robust path
+source(here::here("R", "graph_utils.R")) # Robust path
+
+# 3. Load App Libraries
+library(shiny)
+library(visNetwork)
+library(tidyverse)
+library(igraph)
+library(plotly)
+library(Matrix)
+
+# 4. Load the Production Model
+model_path <- file.path(PATH_APP, "model_current.rds")
+if (!file.exists(model_path)) stop("Model file not found!")
+model <- readRDS(model_path)
+
+fruit_salad_css <- HTML("
+  /* FRUIT SALAD CSS */
+  .hl-bursty { background-color: #d4edda; color: #155724; border-bottom: 2px solid #28a745; }
+  .hl-generic { background-color: #f8d7da; color: #721c24; border-bottom: 2px solid #dc3545; }
+  .hl-query   { background-color: #fff3cd; color: #856404; font-weight: bold; }
+  .hl-shared  { border: 2px solid blue; font-weight: bold; }
+  .vis-network { border: 1px solid #ddd; background: #fff; }
+")
+```
+
+
+```{r}
+#| context: server
+
+# ==============================================================================
+# UI DEFINITION
+# ==============================================================================
+ui <- fluidPage(
+  tags$head(tags$style(fruit_salad_css)),
+  
+  sidebarLayout(
+    sidebarPanel(
+      width = 3,
+      h4("1. Navigation"),
+      textInput("search_term", "Search Corpus:", placeholder = "e.g., kava"),
+      hr(),
+      
+      h4("2. Fruit Salad Controls"),
+      checkboxGroupInput("highlights", "Highlight Layers:",
+                         choices = c("Search Terms" = "query", 
+                                     "Bursty (High Info)" = "bursty", 
+                                     "Generic (Low Info)" = "generic",
+                                     "Shared (Edge)" = "shared"),
+                         selected = c("query", "bursty")),
+      hr(),
+      
+      h4("3. Graph Settings"),
+      sliderInput("threshold", "Edge Threshold", 0.1, 0.9, 0.3)
+    ),
+    
+    mainPanel(
+      width = 9,
+      tabsetPanel(
+        tabPanel("Global Graph", 
+                 visNetworkOutput("net_plot", height = "750px")),
+        
+        tabPanel("Vocabulary Plot",
+                 plotlyOutput("vocab_plot", height = "750px")), # <--- NEW PLOT
+        
+        tabPanel("Inspector",
+                 br(),
+                 h3(textOutput("doc_title")),
+                 htmlOutput("doc_viewer"))
+      )
+    )
+  )
+)
+
+# ==============================================================================
+# SERVER LOGIC
+# ==============================================================================
+server <- function(input, output, session) {
+  
+  # --- A. SEARCH LOGIC ---
+  matched_docs <- reactive({
+    req(input$search_term)
+    term <- tolower(input$search_term)
+    if (term %in% colnames(model$dtm)) {
+      indices <- which(model$dtm[, term] > 0)
+      return(rownames(model$dtm)[indices])
+    }
+    return(NULL)
+  })
+  
+  # --- B. GRAPH RENDER (Instant Static) ---
+  output$net_plot <- renderVisNetwork({
+    g <- model$graph 
+    target_ids <- if(isTruthy(input$search_term)) matched_docs() else NULL
+    
+    # 1. Prepare Data
+    # (Since x/y are now in 'g', they are automatically included here)
+    vis_data <- prepare_visual_graph(g, target_ids)
+    
+    # 2. Render
+    visNetwork(vis_data$nodes, vis_data$edges) %>%
+      visEdges(
+        smooth = FALSE, 
+        width = 0.5, 
+        color = list(color = "rgba(150,150,150, 0.4)", highlight = "black")
+      ) %>%
+      # CRITICAL: Disable physics. 
+      # The graph is already laid out. This freezes it in place.
+      visPhysics(enabled = FALSE) %>%
+      visInteraction(multiselect = TRUE, navigationButtons = TRUE, 
+                     zoomView = TRUE, dragView = TRUE) %>%
+      visEvents(select = "function(nodes) { Shiny.onInputChange('sel_node', nodes.nodes); }")
+  })
+  
+  # --- C. VOCABULARY PLOT (Interactive Residuals) ---
+  output$vocab_plot <- renderPlotly({
+    # We plot Entropy vs Frequency, colored by Residual
+    plot_ly(data = model$stats, 
+            x = ~log10(Frequency), 
+            y = ~Entropy, 
+            text = ~Term,
+            color = ~Residual,
+            colors = "RdBu", # Red = High Entropy (Generic), Blue = Low Entropy (Bursty)
+            type = 'scatter', 
+            mode = 'markers',
+            marker = list(size = 6, opacity = 0.7)) %>%
+      layout(
+        title = "Word Entropy vs. Frequency (Residual Gap)",
+        xaxis = list(title = "Log10 Frequency"),
+        yaxis = list(title = "Entropy (Distribution)"),
+        shapes = list(
+          # Optional: Add the regression line visualization if desired
+          # But the color scale handles the visual separation well
+        )
+      )
+  })
+  
+  # --- D. DOC INSPECTOR (UPDATED FRUIT SALAD) ---
+  observeEvent(input$sel_node, {
+    req(input$sel_node)
+    
+    # Case 1: Single Node Selected
+    if(length(input$sel_node) == 1) {
+      doc_id <- input$sel_node[1]
+      raw <- model$full_text[doc_id]
+      doc_terms <- names(which(model$dtm[doc_id,] > 0))
+      
+      groups <- list()
+      
+      # 1. Search Query
+      if ("query" %in% input$highlights && isTruthy(input$search_term)) {
+        groups$query <- c(input$search_term)
+      }
+      
+      # 2. Bursty Words (Residual < -0.5)
+      if ("bursty" %in% input$highlights) {
+        groups$bursty <- model$stats %>% 
+          filter(Term %in% doc_terms, Residual < -0.5) %>%
+          pull(Term)
+      }
+      
+      # 3. Generic Words (Residual > 0.5)
+      if ("generic" %in% input$highlights) {
+        groups$generic <- model$stats %>% 
+          filter(Term %in% doc_terms, Residual > 0.5) %>%
+          pull(Term)
+      }
+      
+      final_html <- highlight_fruit_salad(raw, groups)
+      output$doc_viewer <- renderUI({ HTML(gsub("\n", "<br>", final_html)) })
+      output$doc_title <- renderText({ paste("Document:", doc_id) })
+      
+    } 
+    # Case 2: Comparison (Shared Terms)
+    else if (length(input$sel_node) == 2) {
+      doc_A <- input$sel_node[1]
+      doc_B <- input$sel_node[2]
+      raw <- model$full_text[doc_A]
+      groups <- list()
+      
+      if ("shared" %in% input$highlights) {
+        vec_A <- model$dtm[doc_A, , drop=FALSE]
+        vec_B <- model$dtm[doc_B, , drop=FALSE]
+        terms_A <- names(which(vec_A[1,] > 0))
+        terms_B <- names(which(vec_B[1,] > 0))
+        groups$shared <- intersect(terms_A, terms_B)
+      }
+      
+      final_html <- highlight_fruit_salad(raw, groups)
+      output$doc_viewer <- renderUI({ HTML(gsub("\n", "<br>", final_html)) })
+      output$doc_title <- renderText({ paste("Comparison:", doc_A, "vs", doc_B) })
+    }
+  })
+}
+
+# Run
+shinyApp(ui, server)
+```
+
+

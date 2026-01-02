@@ -332,7 +332,7 @@ analyze_clusters <- function(g, dtm, corpus, method = "tfidf", resolution = 1.0)
     bind_tf_idf(term, cluster_id, n) %>%
     group_by(cluster_id) %>%
     arrange(desc(tf_idf)) %>%
-    slice_head(n = 10) %>%
+    slice_head(n = 15) %>%  
     summarise(
       top_terms = paste(term, collapse = ", ")
     )
@@ -553,14 +553,14 @@ analyze_rank_curves <- function(corpus, k = 1.2, b = 0.75) {
   # 1. Raw TF Rank
   curve_tf <- corpus$term_stats %>%
     arrange(desc(tf_global)) %>%
-    mutate(rank = row_number(), score = tf_global, metric = "Raw Frequency (Zipf)")
+    mutate(rank = row_number(), score = tf_global, metric = "Raw frequency (Zipf)")
   
   # 2. TF * IDF Rank
   # (Global Sum of TF) * IDF
   curve_tfidf <- corpus$term_stats %>%
     mutate(score = tf_global * idf) %>%
     arrange(desc(score)) %>%
-    mutate(rank = row_number(), metric = "Global TF-IDF")
+    mutate(rank = row_number(), metric = "Global term frequency * inverse document frequency (TF*IDF)")
   
   # 3. Global BM25 Approximation
   # We approximate global importance by assuming an 'Average Document' context
@@ -573,7 +573,7 @@ analyze_rank_curves <- function(corpus, k = 1.2, b = 0.75) {
       score = idf_bm25 * ((avg_tf * (k + 1)) / (avg_tf + k)) * df 
     ) %>%
     arrange(desc(score)) %>%
-    mutate(rank = row_number(), metric = "Global BM25 Mass")
+    mutate(rank = row_number(), metric = "Global BM25 mass")
   
   # Combine
   bind_rows(
@@ -583,23 +583,41 @@ analyze_rank_curves <- function(corpus, k = 1.2, b = 0.75) {
   )
 }
 
-#' Plot the Rank Curves
+#' Plot the Rank Curves (Combined)
 plot_rank_curves <- function(curve_data) {
-  ggplot(curve_data, aes(x = rank, y = score, color = metric)) +
+  
+  # FIX: Filter out non-positive scores to prevent log-scale warnings
+  # (Removes stopwords with negative/zero IDF that break the log plot)
+  plot_data <- curve_data %>% 
+    filter(score > 1e-9) 
+  
+  # Calculate intercept for reference line
+  max_score <- max(plot_data$score, na.rm = TRUE)
+  
+  ggplot(plot_data, aes(x = rank, y = score, color = metric)) +
+    # Reference Line
+    geom_abline(slope = -1, intercept = log10(max_score), 
+                linetype = "dashed", color = "black", alpha = 0.5) +
+    
+    # The Curves
     geom_line(size = 1) +
+    
+    # Scales
     scale_x_log10(labels = scales::comma) +
     scale_y_log10(labels = scales::comma) +
-    facet_wrap(~metric, scales = "free_y", ncol = 1) +
+    
+    # Legend Wrapping
+    scale_color_discrete(labels = function(x) stringr::str_wrap(x, width = 25)) +
+    
     theme_minimal() +
     labs(
-      title = "LexicalRank: Comparing Term Importance Models",
-      subtitle = "Log-Log Scale to identify Power Laws vs. Information Content",
-      x = "Log Rank",
-      y = "Log Score"
+      title = "Lexical rank: Comparing the Zipf rank-frequency curve to formulas for term importance",
+      subtitle = "Solid lines = Ranking formulae; Dashed line = Theoretical Zipfian distribution (Slope -1)",
+      x = "Log rank",
+      y = "Log score",
+      color = NULL 
     )
 }
-
-
 
 run_model_suite <- function(corpus, vectors = NULL, threshold = 0.3, boot_iter = 50) {
   
@@ -609,10 +627,12 @@ run_model_suite <- function(corpus, vectors = NULL, threshold = 0.3, boot_iter =
   
   # --- Define Models to Test ---
   models <- list(
+    "Term frequency"    = list(method = "tf", vecs = NULL),
     "TF-IDF"            = list(method = "tfidf", vecs = NULL),
     "BM25"              = list(method = "bm25",  vecs = NULL),
     "Jaccard"           = list(method = "jaccard", vecs = NULL), 
-    "Embeddings (Wgt)"  = list(method = "embeddings_weighted", vecs = vectors)
+    "Embeddings (mean)" = list(method = "embeddings_mean", vecs = vectors),
+    "Embeddings (TF-IDF weighted)"  = list(method = "embeddings_weighted", vecs = vectors)
     # Add others here if needed (Jaccard, TF, etc.)
   )
   
