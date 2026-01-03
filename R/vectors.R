@@ -96,3 +96,81 @@ get_mean_document_vectors <- function(tokens_df, term_vectors) {
   
   return(doc_vectors)
 }
+
+#' Bootstrap Embedding Stability
+#' Checks if nearest neighbors remain consistent across corpus resamples.
+#' 
+#' @param text_df The content dataframe (doc_id, text)
+#' @param original_vectors The matrix from the full run
+#' @param n_iter Number of bootstraps (e.g., 10)
+#' @param test_terms Vector of terms to check (or NULL for top 50 freq)
+#' @return A dataframe of stability scores per term
+test_embedding_stability <- function(text_df, original_vectors, vocab_stats, n_iter = 10, test_terms = NULL) {
+  
+  message(sprintf(">> Testing Embedding Stability (%d iters)...", n_iter))
+  
+  # 1. Define Test Set
+  if(is.null(test_terms)) {
+    # Default: Top 50 most frequent terms
+    test_terms <- vocab_stats %>% 
+      arrange(desc(term_count)) %>% 
+      head(50) %>% 
+      pull(term)
+  }
+  
+  # Filter to terms actually in vectors
+  test_terms <- intersect(test_terms, rownames(original_vectors))
+  if(length(test_terms) == 0) stop("No test terms found in vector model.")
+  
+  # 2. Helper: Get Top 10 Neighbors
+  get_nn <- function(target, vec_matrix, k=10) {
+    # Cosine Sim
+    sims <- text2vec::sim2(vec_matrix, vec_matrix[target, , drop=FALSE], method="cosine")
+    names(sort(sims[,1], decreasing = TRUE))[2:(k+1)] # Skip self
+  }
+  
+  # 3. Calculate Original Neighbors
+  base_nn <- lapply(test_terms, function(t) get_nn(t, original_vectors))
+  names(base_nn) <- test_terms
+  
+  stability_scores <- list()
+  
+  # 4. Bootstrap Loop
+  for(i in 1:n_iter) {
+    # Resample Content
+    boot_indices <- sample(nrow(text_df), nrow(text_df), replace = TRUE)
+    boot_df <- text_df[boot_indices, ]
+    boot_df$doc_id <- paste0(boot_df$doc_id, "_", 1:nrow(boot_df)) # Uniquify IDs
+    
+    # Train New Vectors (Silence the logs)
+    # Note: We must use the same params (Window, Rank) as the main run
+    suppressMessages({
+      boot_res <- generate_corpus_vectors(boot_df, min_count = 5, window_size = 10, rank = ncol(original_vectors))
+    })
+    boot_vecs <- boot_res$vectors
+    
+    # Compare Neighbors
+    iter_scores <- numeric()
+    for(term in test_terms) {
+      if(term %in% rownames(boot_vecs)) {
+        # Overlap
+        set_a <- base_nn[[term]]
+        set_b <- get_nn(term, boot_vecs)
+        overlap <- length(intersect(set_a, set_b)) / length(union(set_a, set_b))
+        iter_scores[term] <- overlap
+      } else {
+        iter_scores[term] <- 0 # Term dropped out of vocab (Unstable)
+      }
+    }
+    stability_scores[[i]] <- iter_scores
+  }
+  
+  # 5. Aggregate
+  results <- do.call(rbind, stability_scores)
+  summary_df <- data.frame(
+    term = colnames(results),
+    stability_score = colMeans(results, na.rm=TRUE)
+  ) %>% arrange(stability_score)
+  
+  return(summary_df)
+}

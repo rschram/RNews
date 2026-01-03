@@ -150,3 +150,110 @@ get_graph_metrics <- function(g) {
     Density = dens
   )
 }
+
+#' Extract Graph Backbone (MST + Strongest Edges)
+#' Preserves topology while reducing visual density.
+get_graph_backbone <- function(g, keep_fraction = 0.05) {
+  
+  if (igraph::ecount(g) == 0) return(g)
+  
+  # 1. Calculate MST (Minimize negative weight)
+  igraph::E(g)$neg_weight <- -igraph::E(g)$weight
+  g_mst <- igraph::mst(g, weights = igraph::E(g)$neg_weight)
+  
+  # 2. Helper to create robust IDs (Sorted A|B)
+  get_edge_ids <- function(df) {
+    p1 <- pmin(df$from, df$to)
+    p2 <- pmax(df$from, df$to)
+    paste(p1, p2, sep="|")
+  }
+  
+  # 3. Identify Edges
+  edges_df <- igraph::as_data_frame(g, what = "edges")
+  mst_edges <- igraph::as_data_frame(g_mst, what = "edges")
+  
+  mst_ids <- get_edge_ids(mst_edges)
+  
+  # 4. Top Strongest Edges
+  n_total <- nrow(edges_df)
+  n_keep <- ceiling(n_total * keep_fraction)
+  
+  sorted_edges <- edges_df[order(edges_df$weight, decreasing = TRUE), ]
+  top_edges <- head(sorted_edges, n_keep)
+  top_ids <- get_edge_ids(top_edges)
+  
+  # 5. Union & Filter
+  keep_ids <- union(mst_ids, top_ids)
+  
+  el_df <- as.data.frame(igraph::as_edgelist(g), stringsAsFactors = FALSE)
+  colnames(el_df) <- c("from", "to")
+  all_ids <- get_edge_ids(el_df)
+  
+  g_backbone <- igraph::subgraph.edges(g, which(all_ids %in% keep_ids), delete.vertices = FALSE)
+  
+  return(g_backbone)
+}
+
+#' Explain SCM Edge (Vectorized)
+get_scm_edge_breakdown <- function(doc_id_A, doc_id_B, dtm, vectors, top_n = 10) {
+  
+  # 1. Get Terms
+  vec_A <- dtm[doc_id_A, , drop = FALSE]
+  vec_B <- dtm[doc_id_B, , drop = FALSE]
+  
+  terms_A <- names(which(vec_A[1, ] > 0))
+  terms_B <- names(which(vec_B[1, ] > 0))
+  
+  # 2. Filter Vectors
+  all_terms <- union(terms_A, terms_B)
+  valid_terms <- intersect(all_terms, rownames(vectors))
+  
+  if (length(valid_terms) == 0) return(NULL)
+  
+  sub_vecs <- vectors[valid_terms, , drop = FALSE]
+  
+  # 3. Calculate Sim Matrix (valid_terms x valid_terms)
+  term_sim <- text2vec::sim2(sub_vecs, method = "cosine")
+  
+  # 4. Calculate Contribution Matrix (Algebra instead of Loops)
+  # Extract weights as dense vectors for the valid subset
+  wA <- as.numeric(vec_A[1, valid_terms])
+  wB <- as.numeric(vec_B[1, valid_terms])
+  
+  # Outer product: Matrix of (weight_A * weight_B)
+  weight_mat <- outer(wA, wB)
+  
+  # Element-wise multiply by similarity
+  contrib_mat <- weight_mat * term_sim
+  
+  # 5. Filter & Format
+  # Set generic threshold to ignore noise
+  contrib_mat[contrib_mat < 0.3] <- 0
+  
+  # Find indices of non-zero contributions
+  # arr.ind=TRUE returns row/col indices
+  hits <- which(contrib_mat > 0, arr.ind = TRUE)
+  
+  if (nrow(hits) == 0) return(data.frame(Info="No significant semantic links"))
+  
+  # Construct Result DataFrame
+  results <- data.frame(
+    Term_A = valid_terms[hits[,1]],
+    Term_B = valid_terms[hits[,2]],
+    Sim = term_sim[hits],
+    Contrib = contrib_mat[hits],
+    stringsAsFactors = FALSE
+  )
+  
+  # Sort and return
+  results %>%
+    arrange(desc(Contrib)) %>%
+    head(top_n) %>%
+    mutate(
+      Pair = paste0(Term_A, " <-> ", Term_B),
+      Score = round(Contrib, 3)
+    ) %>%
+    select(Pair, Score, Sim)
+}
+
+

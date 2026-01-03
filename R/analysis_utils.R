@@ -310,7 +310,7 @@ analyze_clusters <- function(g, dtm, corpus, method = "tfidf", resolution = 1.0)
     g, 
     objective_function = "modularity", 
     weights = E(g)$weight,
-    resolution_parameter = resolution
+    resolution = resolution
   )
   membership <- membership(comm)
   cluster_ids <- sort(unique(membership))
@@ -460,12 +460,17 @@ run_test_bench <- function(corpus, method = "tfidf", threshold = 0.2,
     sim <- text2vec::sim2(dtm, method = "cosine", norm = "l2")
     
   } else {
-    # Sparse Methods
+    # Sparse Methods (TFIDF, BM25, SCM)
     dtm <- get_document_matrix(corpus, method = method, k = bm25_k, b = bm25_b)
     
-    # <--- FIXED: Correctly logic for Jaccard vs Cosine
-    sim_type <- ifelse(method %in% c("binary", "jaccard"), "jaccard", "cosine")
-    sim <- compute_similarity(dtm, method = sim_type)
+    # Logic to handle SCM or fallback to Jaccard/Cosine
+    if (method == "scm") {
+      sim_type <- "scm"
+    } else {
+      sim_type <- ifelse(method %in% c("binary", "jaccard"), "jaccard", "cosine")
+    }
+    
+    sim <- compute_similarity(dtm, method = sim_type, vectors = vectors)
   }
   
   # 2. Phase 3: Bootstrap Topology
@@ -632,7 +637,8 @@ run_model_suite <- function(corpus, vectors = NULL, threshold = 0.3, boot_iter =
     "BM25"              = list(method = "bm25",  vecs = NULL),
     "Jaccard"           = list(method = "jaccard", vecs = NULL), 
     "Embeddings (mean)" = list(method = "embeddings_mean", vecs = vectors),
-    "Embeddings (TF-IDF weighted)"  = list(method = "embeddings_weighted", vecs = vectors)
+    "Embeddings (TF-IDF weighted)"  = list(method = "embeddings_weighted", vecs = vectors), 
+    "Soft cosine measure" = list(method = "scm", vecs = vectors)
     # Add others here if needed (Jaccard, TF, etc.)
   )
   

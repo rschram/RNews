@@ -6,6 +6,7 @@ library(igraph)
 library(Matrix)
 library(text2vec)
 library(here)
+library(plotly)
 
 # ==============================================================================
 # 1. ROBUST PATHS (Fixes the "Missing File" Warning)
@@ -81,6 +82,10 @@ if (is.null(model$meta)) {
     else if (!is.null(corpus_obj$meta)) model$meta <- corpus_obj$meta
   }
 }
+
+
+
+
 # ==============================================================================
 # 3. PRE-CALCULATION (Layout & Metadata)
 # ==============================================================================
@@ -114,6 +119,61 @@ if (igraph::vcount(model$graph) > 0) {
   }
 }
 
+
+# ==============================================================================
+# UI Styles
+# ==============================================================================
+
+fruit_salad_css <- "
+  /* Base Highlight Box */
+  .hl-base {
+    position: relative;
+    border-radius: 4px;
+    padding: 2px 2px;
+    margin: 0 1px;
+    cursor: pointer;
+    transition: all 0.2s;
+    display: inline-block; /* Essential for the float behavior */
+    line-height: 1.4;
+  }
+
+  /* Specific Groups */
+  .hl-bursty { background-color: rgba(46, 204, 113, 0.2); border-bottom: 2px solid #2ecc71; }
+  .hl-shared { background-color: rgba(52, 152, 219, 0.2); border-bottom: 2px solid #3498db; }
+  .hl-query  { background-color: rgba(241, 196, 15, 0.3); border-bottom: 2px solid #f1c40f; }
+
+  /* The 'Floated' Footnote Badge */
+  .hl-badge {
+    position: absolute;
+    top: -8px;
+    right: -8px;
+    background-color: #333;
+    color: white;
+    font-size: 9px;
+    font-weight: bold;
+    border-radius: 50%;
+    width: 16px;
+    height: 16px;
+    text-align: center;
+    line-height: 16px;
+    z-index: 10;
+    box-shadow: 1px 1px 2px rgba(0,0,0,0.2);
+    display: none; /* Hidden by default */
+  }
+
+  /* Show badge on hover */
+  .hl-base:hover .hl-badge {
+    display: block;
+  }
+
+  /* Hover state for the box */
+  .hl-base:hover {
+    filter: brightness(0.95);
+  }
+"
+
+
+
 # ==============================================================================
 # UI
 # ==============================================================================
@@ -138,13 +198,18 @@ ui <- fluidPage(
       uiOutput("live_metrics"), # <--- LIVE STATS HERE
       hr(),
       
-      # --- 3. REBUILD CONTROLS ---
-      h4("3. Reconstruction"),
-      sliderInput("burst_percentile", "Vocab Specificity:", 
-                  min = 0, max = 0.95, value = 0, step = 0.05, post = "cut"),
-      sliderInput("threshold", "Link Strength:", 0.1, 0.9, 0.5, step = 0.05),
-      actionButton("update_graph", "Re-Build Graph", icon = icon("sync"), 
-                   class = "btn-primary btn-block")
+      # --- 3. VIEW CONTROLS (Updated) ---
+      h4("3. View Settings"),
+      
+      # Changed: "Backbone Density" instead of "Link Strength"
+      # We limit this to 0% - 20% of extra edges to prevent hairballs.
+      sliderInput("density_fraction", "Edge Density:", 
+                  min = 0, max = 0.20, value = 0.05, step = 0.01, post = "%"),
+      
+      # Removed: "Re-Build Graph" button and "burst_percentile" slider
+      # to enforce strict alignment with the offline model.
+      div(class = "alert alert-info", style = "font-size: 11px;",
+          icon("info-circle"), " Displaying fixed model topology.")
     ),
     
     mainPanel(
@@ -171,6 +236,9 @@ ui <- fluidPage(
                   tabPanel("Document Reader", icon = icon("file-alt"),
                            br(),
                            uiOutput("inspector_header"),
+                           # Add the button here
+                           downloadButton("download_transcript", "Download Transcript", class = "btn-sm"), 
+                           hr(),
                            htmlOutput("doc_viewer")
                   ),
                   
@@ -189,52 +257,13 @@ ui <- fluidPage(
 server <- function(input, output, session) {
   
   # --- A. DATA REACTIVES ---
-  current_graph <- eventReactive(input$update_graph, {
-    
-    withProgress(message = "Re-building graph...", detail = "Calculating Similarity...", {
-      
-      # (Vocab filtering logic can stay, though it only affects DTM mode now)
-      cutoff_rank <- input$burst_percentile
-      n_terms <- nrow(model$stats)
-      keep_n <- ceiling(n_terms * (1 - cutoff_rank))
-      vocab_terms <- model$stats %>% arrange(Residual) %>% head(keep_n) %>% pull(Term)
-      
-      # --- FIX 3: PASS VECTORS ---
-      # This ensures the rebuild matches the offline Embedding analysis
-      g_new <- build_dynamic_graph(model$dtm, 
-                                   vectors = vectors, # <--- PASS VECTORS HERE
-                                   threshold = input$threshold, 
-                                   vocab_terms = vocab_terms)
-      
-      incProgress(0.6, detail = "Calculating Layout...")
-      
-      # Calculate Layout
-      coords <- igraph::layout_with_drl(g_new, options=list(simmer.attraction=0))
-      igraph::V(g_new)$x <- coords[,1] * 100
-      igraph::V(g_new)$y <- coords[,2] * 100
-      
-      # --- FIX 4: PRESERVE TITLES ---
-      # Re-attach titles so tooltips don't vanish on rebuild
-      if (!is.null(model$meta)) {
-        indices <- match(igraph::V(g_new)$name, model$meta$doc_id)
-        titles <- model$meta$headline[indices]
-        titles[is.na(titles)] <- igraph::V(g_new)$name[is.na(titles)]
-        igraph::V(g_new)$title <- titles
-      }
-      
-      return(g_new)
-    })
-  }, ignoreNULL = FALSE)
   
   final_graph <- reactive({
-    # If the user hasn't clicked update yet, use the static model
-    if (input$update_graph == 0) {
-      return(model$graph)
-    } else {
-      return(current_graph())
-    }
+    # Always return the offline model's graph
+    # (Ensure your QMD saved the full graph, e.g. threshold 0.1 or 0.2)
+    req(model$graph)
+    return(model$graph)
   })
-  
   
   # --- B. SEARCH LOGIC ---
   matched_docs <- reactive({
@@ -247,38 +276,34 @@ server <- function(input, output, session) {
     return(NULL)
   })
   
-  
-  # --- C. GRAPH RENDER ---
+
+  # --- C. GRAPH RENDER (With Backbone) ---
   output$net_plot <- renderVisNetwork({
+    req(final_graph())
     g <- final_graph()
     target_ids <- if(isTruthy(input$search_term)) matched_docs() else NULL
     
-    # --- FIX 2: FAST EDGE FILTERING ---
-    # We filter edges visually based on the slider. 
-    # This prevents rendering 50,000 weak edges on startup.
-    # Note: We can only filter UP (higher threshold). To go lower than 
-    # the base model (0.3), the user must click "Re-Build".
+    # 1. Apply Backbone Filter
+    # This keeps the MST (connectivity) + Top X% strongest edges (density)
+    # It ensures all nodes remain visible (no isolates hidden) but renders fast.
+    g_vis <- get_graph_backbone(g, keep_fraction = input$density_fraction)
     
-    current_threshold <- input$threshold
-    
-    # Prune edges below threshold (Fast visual filter)
-    # delete.edges is very fast compared to re-layout
-    g_vis <- igraph::subgraph.edges(g, igraph::E(g)[weight >= current_threshold], delete.vertices = FALSE)
-    
+    # 2. Prepare for VisNetwork
     vis_data <- prepare_visual_graph(g_vis, target_ids)
     
     visNetwork(vis_data$nodes, vis_data$edges) %>%
-      visEdges(smooth = FALSE, width = 0.5, color = list(color = "rgba(150,150,150, 0.4)", highlight = "black")) %>%
+      visEdges(smooth = FALSE, width = 0.5, 
+               color = list(color = "rgba(150,150,150, 0.4)", highlight = "black")) %>%
       
-      # Node Styling (Large & Blue)
+      # Node Styling
       visNodes(size = 30, shape = "dot", 
                color = list(background = "#97C2FC", border = "#2B7CE9", highlight = "#FF4040")) %>%
       
       visPhysics(enabled = FALSE) %>% 
-      visInteraction(multiselect = TRUE, navigationButtons = TRUE, zoomView = TRUE, dragView = TRUE) %>%
+      visInteraction(multiselect = TRUE, navigationButtons = TRUE, 
+                     zoomView = TRUE, dragView = TRUE) %>%
       visEvents(select = "function(nodes) { Shiny.onInputChange('sel_node', nodes.nodes); }")
-  })
-  
+  })  
   # --- LIVE METRICS RENDERER ---
   output$live_metrics <- renderUI({
     g <- final_graph()
@@ -304,8 +329,8 @@ server <- function(input, output, session) {
     
     # 1. Calculate the Threshold (The Red Line)
     # Slider (0.0 - 0.95): Represents % of generic words to cut.
-    # High Slider = Low Threshold (Only keeping very negative residuals/bursty words)
-    threshold_val <- quantile(model$stats$Residual, 
+    # High Slider = Low Threshold (Only keeping very negative "entropy gaps" (residuals) or bursty words)
+    threshold_val <- quantile(model$stats$Entropy_Gap, 
                               probs = (1 - input$burst_percentile), 
                               na.rm = TRUE)
     
@@ -322,15 +347,15 @@ server <- function(input, output, session) {
         text = ~paste("Term:", Term, 
                       "<br>Freq:", Frequency,
                       "<br>Entropy:", round(Entropy, 2),
-                      "<br>Residual:", round(Residual, 2)),
-        color = ~Residual, 
-        colors = "RdBu", # Blue = Bursty (Low Residual), Red = Generic
+                      "<br>Entropy gap:", round(Entropy_Gap, 2)),
+        color = ~Entropy_Gap, 
+        colors = "RdBu", # Blue = Bursty (Low Entropy_Gap), Red = Generic
         marker = list(opacity = 0.6, size = 6),
         name = "Words"
       ) %>%
       
       # Layer B: The "Null Model" (Gray Dashed Line)
-      # This represents Residual = 0 (Expected Entropy)
+      # This represents Entropy_Gap = 0 (Expected Entropy)
       add_lines(
         x = ~log10(Frequency),
         y = ~Expected_Entropy,
@@ -360,16 +385,18 @@ server <- function(input, output, session) {
   })
   
   # --- SELECTION WORKBENCH TABLE ---
+  # --- SELECTION WORKBENCH TABLE (SCM Aware) ---
   output$selection_table <- renderTable({
     req(input$sel_node)
     sel <- input$sel_node
     
-    # 1. Build Base Table for Each Selected Doc
+    # 1. Base Table
     df <- data.frame(
       Doc_ID = sel,
       Headline = NA_character_,
       Bursty_Topic = NA_character_,
-      Shared_Connectors = NA_character_,
+      # Changed column name to reflect new logic
+      SCM_Drivers = NA_character_, 
       stringsAsFactors = FALSE
     )
     
@@ -377,49 +404,51 @@ server <- function(input, output, session) {
     for(i in seq_along(sel)) {
       doc_id <- sel[i]
       
-      # A. Headline (from metadata)
+      # A. Headline
       if (!is.null(model$meta)) {
         match_idx <- match(doc_id, model$meta$doc_id)
-        if (!is.na(match_idx)) {
-          df$Headline[i] <- model$meta$headline[match_idx]
-        } else {
-          df$Headline[i] <- "(No Metadata)"
-        }
-      } else {
-        df$Headline[i] <- "-"
+        df$Headline[i] <- if(!is.na(match_idx)) model$meta$headline[match_idx] else "(No Metadata)"
       }
       
-      # B. Bursty Words (Top 3 Distinctive)
+      # B. Bursty Words (Top 3)
       terms <- names(which(model$dtm[doc_id,] > 0))
       top_words <- model$stats %>% 
         filter(Term %in% terms) %>%
-        arrange(Residual) %>% # Low Residual = Bursty
+        arrange(Entropy_Gap) %>% 
         head(3) %>%
         pull(Term) %>%
         paste(collapse = ", ")
-      
       df$Bursty_Topic[i] <- top_words
       
-      # C. Intersection Logic (Edge Decomposition)
-      # If we have exactly 2 docs, show shared terms between them.
+      # C. SCM Decomposition (The New Logic)
       if (length(sel) == 2) {
-        other_id <- sel[setdiff(1:2, i)] # The "other" index
+        # Only compute pairwise explanation if exactly 2 docs selected
+        other_id <- sel[setdiff(1:2, i)]
         
-        # Get intersection
-        vec_A <- model$dtm[doc_id, , drop=FALSE]
-        vec_B <- model$dtm[other_id, , drop=FALSE]
-        common <- intersect(names(which(vec_A[1,]>0)), names(which(vec_B[1,]>0)))
-        
-        # Sort common by rarity (Entropy)? Or just list them?
-        # Let's list top 5 shared terms
-        if(length(common) > 0) {
-          shared_str <- paste(head(common, 5), collapse = ", ")
-          df$Shared_Connectors[i] <- shared_str
+        # Check if we have vectors available for SCM
+        if (!is.null(vectors)) {
+          # Use the new utility function
+          scm_breakdown <- get_scm_edge_breakdown(doc_id, other_id, model$dtm, vectors, top_n = 5)
+          
+          if (!is.null(scm_breakdown) && nrow(scm_breakdown) > 0) {
+            # Format: "protest <-> riot (0.82)"
+            pairs_str <- paste(
+              sprintf("%s (%.2f)", scm_breakdown$Pair, scm_breakdown$Sim), 
+              collapse = ", "
+            )
+            df$SCM_Drivers[i] <- pairs_str
+          } else {
+            df$SCM_Drivers[i] <- "(No strong links)"
+          }
         } else {
-          df$Shared_Connectors[i] <- "(None)"
+          # Fallback to simple intersection if no vectors
+          vec_A <- model$dtm[doc_id, , drop=FALSE]
+          vec_B <- model$dtm[other_id, , drop=FALSE]
+          common <- intersect(names(which(vec_A[1,]>0)), names(which(vec_B[1,]>0)))
+          df$SCM_Drivers[i] <- paste(head(common, 5), collapse = ", ")
         }
       } else {
-        df$Shared_Connectors[i] <- "-"
+        df$SCM_Drivers[i] <- "-"
       }
     }
     
@@ -475,94 +504,88 @@ server <- function(input, output, session) {
   })
   
   # 3. Render the Text (LIVE UPDATES)
-  # This uses renderUI directly, so it reacts INSTANTLY to:
-  # - focused_doc_id() changes (Switching docs)
-  # - input$highlights changes (Toggling checkboxes)
-  # - input$search_term changes (New search highlight)
-  output$doc_viewer <- renderUI({
+  current_html_content <- reactive({
     req(focused_doc_id())
-    
     doc_id <- focused_doc_id()
     
-    # Safety Check: ID must exist in corpus
-    if (!doc_id %in% names(model$full_text)) return(h4("Doc ID not found in text store."))
+    # Safety Check
+    if (!doc_id %in% names(model$full_text)) return("<h4>Doc ID not found.</h4>")
     
-    # A. Get Content
+    # Get Content
     raw <- model$full_text[doc_id]
     doc_terms <- names(which(model$dtm[doc_id,] > 0))
     
-    # B. Build Highlight Groups (Dynamic)
+    # Build Highlight Groups
     groups <- list()
     
-    # Layer 1: Search Query (Yellow)
+    # Layer 1: Search Query
     if ("query" %in% input$highlights && isTruthy(input$search_term)) {
       groups$query <- c(input$search_term)
     }
     
-    # Layer 2: Bursty Words (Green)
+    # Layer 2: Bursty Words
     if ("bursty" %in% input$highlights) {
       top_bursty <- model$stats %>% 
         filter(Term %in% doc_terms) %>%
-        arrange(Residual) %>% # Lowest Residual = Most Bursty
+        arrange(Entropy_Gap) %>% 
         head(20) %>%
         pull(Term)
       groups$bursty <- top_bursty
     }
     
-    # Layer 3: Shared Terms (Blue)
-    # Active if "shared" is checked AND we have a comparison (2+ nodes selected)
+    # Layer 3: Shared Terms (Edge Composition)
     if ("shared" %in% input$highlights && length(input$sel_node) > 1) {
-      
-      # 1. Identify the "Other" documents in the selection
-      # (All selected nodes EXCEPT the one currently being viewed)
       current_doc <- doc_id
       other_docs <- setdiff(input$sel_node, current_doc)
       
-      # 2. Calculate Intersection
-      # We find terms present in the Current Doc AND at least one of the Other Docs.
-      # (Standard "Edge" definition: Term exists in A and B)
-      
-      # Get vector for current doc
+      # Intersection Logic
       vec_current <- model$dtm[current_doc, , drop=FALSE]
       terms_current <- names(which(vec_current[1, ] > 0))
       
-      # Get vectors for other docs (summed or checked individually)
-      # Fast way: Check against the first "Other" doc (primary comparison)
-      # Robust way: Check against ALL others (union of others)
-      
-      if (length(other_docs) > 0) {
-        # Let's compare against the first 'other' for clarity in pairwise mode
-        # or aggregate all others if multi-select.
-        
-        # Strategy: Get terms in the 'other' selection
-        vec_others <- model$dtm[other_docs, , drop=FALSE]
-        # Using Matrix::colSums to find non-zero columns in the slice
-        if (length(other_docs) > 1) {
-          counts_others <- Matrix::colSums(vec_others)
-          terms_others <- names(which(counts_others > 0))
-        } else {
-          terms_others <- names(which(vec_others[1, ] > 0))
-        }
-        
-        # Intersection: Terms in Current AND Terms in Others
-        common_terms <- intersect(terms_current, terms_others)
-        
-        # Add to highlight group
-        if (length(common_terms) > 0) {
-          groups$shared <- common_terms
-        }
+      vec_others <- model$dtm[other_docs, , drop=FALSE]
+      if (length(other_docs) > 1) {
+        counts_others <- Matrix::colSums(vec_others)
+        terms_others <- names(which(counts_others > 0))
+      } else {
+        terms_others <- names(which(vec_others[1, ] > 0))
       }
+      
+      common_terms <- intersect(terms_current, terms_others)
+      if (length(common_terms) > 0) groups$shared <- common_terms
     }
     
-    # C. Highlight
-    # Check if highlight function exists
+    # Generate HTML
     if(exists("highlight_fruit_salad")) {
       final_html <- highlight_fruit_salad(raw, groups)
-      HTML(gsub("\n", "<br>", final_html))
+      # Convert newlines to breaks for display
+      return(gsub("\n", "<br>", final_html))
     } else {
-      HTML("<b style='color:red'>Error: Highlighter function not found.</b>")
+      return("<b style='color:red'>Error: Highlighter function not found.</b>")
     }
   })
+  
+  # --- 2. OUTPUT: Render the Text to Screen ---
+  output$doc_viewer <- renderUI({
+    # Simply call the reactive
+    HTML(current_html_content())
+  })
+  
+  # --- 3. OUTPUT: Handle the Download ---
+  output$download_transcript <- downloadHandler(
+    filename = function() { paste0("transcript_", focused_doc_id(), ".html") },
+    content = function(file) {
+      # Construct the standalone HTML file
+      full_html <- paste0(
+        "<html><head><style>", fruit_salad_css, 
+        "</style><style>body { font-family: sans-serif; max-width: 800px; margin: 2rem auto; line-height: 1.6; }</style>",
+        "</head><body>",
+        "<h3>Document ID: ", focused_doc_id(), "</h3>",
+        current_html_content(), # <--- Calls the same reactive!
+        "</body></html>"
+      )
+      writeLines(full_html, file)
+    }
+  )
 }
 
 shinyApp(ui, server)

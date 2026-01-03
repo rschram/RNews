@@ -74,12 +74,77 @@ get_document_matrix <- function(corpus, method = "tfidf", k = 1.2, b = 1.0) {
 #' Switches between Cosine and Jaccard based on the input.
 #' @param dtm Sparse Matrix from get_document_matrix().
 #' @param method "cosine" or "jaccard".
-compute_similarity <- function(dtm, method = "cosine") {
+compute_similarity <- function(dtm, method = "cosine", vectors = NULL) {
   
   message(sprintf(">> Calculating %s Similarity (%d x %d)...", 
                   method, nrow(dtm), nrow(dtm)))
-  
-  if (method == "cosine") {
+  if (method == "scm") {
+    # --- SOFT COSINE MEASURE ---
+    if(is.null(vectors)) stop("SCM requires a 'vectors' matrix.")
+    
+    # A. Align Vocab
+    # The DTM columns and Vector rows must match exactly
+    common_terms <- intersect(colnames(dtm), rownames(vectors))
+    
+    dtm_sub <- dtm[, common_terms]
+    vec_sub <- vectors[common_terms, ]
+    
+    # B. Calculate Term-Term Similarity (The "Soft" Matrix)
+    # Clip negatives to 0 (SCM doesn't handle negative correlations well)
+    message("   ...computing term-term similarity")
+    term_sim <- text2vec::sim2(vec_sub, method = "cosine", norm = "l2")
+    term_sim[term_sim < 0] <- 0 
+    
+    # Raise to power? (Optional tuning to sharpen matches)
+    # term_sim <- term_sim^2 
+    
+    # C. Calculate Document Similarity
+    # Relaxed Word Mover's Distance (RWMD) is complex, but SCM is:
+    # Sim(A,B) = (A^T * S * B) / sqrt(...)
+    # text2vec has a specialized iterator for this, but for "small data" (2000 docs)
+    # we can do the matrix algebra directly if RAM permits.
+    
+    # Optimized SCM via Matrix Algebra:
+    # 1. Project Docs into "Concept Space": D_concept = DTM * Term_Sim_Matrix
+    # 2. Cosine of D_concept vs DTM
+    # (Mathematically: A * S * B_trans)
+    
+    # Let's use the efficient approach:
+    # Transform the DTM by the Term Similarity
+    dtm_soft <- dtm_sub %*% term_sim
+    
+    # Then standard cosine on the transformed space? 
+    # Not exactly SCM, but very close (Sim of "expanded" documents).
+    # Proper SCM usually requires normalization by the soft-norms.
+    
+    # Easier Implementation:
+    # Use the 'vectors' to compute Document Centroids (which you already have!)
+    # But wait, Centroid Cosine != Soft Cosine.
+    # Soft Cosine preserves frequency information better than Mean Centroids.
+    
+    # Correct SCM Implementation for Sparse Matrices:
+    # M = DTM normalized
+    # S = Term Similarity
+    # Sim = M * S * M'
+    
+    # 1. Normalize DTM rows (L2)
+    # (Note: SCM normalization is complex, usually we just L2 normalize the inputs)
+    dtm_norm <- dtm_sub
+    rs <- sqrt(Matrix::rowSums(dtm_norm^2))
+    dtm_norm <- dtm_norm / rs
+    
+    # 2. Compute
+    message("   ...projecting soft space")
+    # Project: Docs x Terms * Terms x Terms = Docs x Terms (Smoothed)
+    projected <- dtm_norm %*% term_sim 
+    
+    # 3. Final Similarity
+    sim <- Matrix::tcrossprod(projected, dtm_norm)
+    
+    # 4. Standardize format
+    sim <- as(sim, "dgCMatrix") 
+  }
+  else if (method == "cosine") {
     # 1. Calculate Cosine
     sim_dsT <- text2vec::sim2(dtm, method = "cosine", norm = "l2")
     
@@ -120,7 +185,7 @@ compute_similarity <- function(dtm, method = "cosine") {
     )
     
   } else {
-    stop("Method must be 'cosine' or 'jaccard'")
+    stop("Method must be 'scm', 'cosine', or 'jaccard'")
   }
   
   return(sim)

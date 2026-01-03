@@ -124,8 +124,32 @@ if(file.exists(VECTOR_PATH)) {
   saveRDS(vectors_obj, VECTOR_PATH)
 }
 
+stability_report <- test_embedding_stability(
+  text_df = raw_data$content %>% rename(text = full_text), 
+  original_vectors = vectors_obj$vectors,
+  vocab_stats = vectors_obj$stats,
+  n_iter = 5 # Keep low for dev, 20 for paper
+)
+
+# Plot "Hall of Low Stability" (Most Unstable)
+stability_report %>%
+  head(15) %>%
+  gt() %>%
+  tab_header(title = "Least stable concepts", subtitle = "Low Jaccard overlap in bootstrap")
+
+# Plot "Hall of Stability" (Most Unstable)
+stability_report %>%
+  arrange(desc(stability_score)) %>%
+  head(15) %>%
+  gt() %>%
+  tab_header(title = "Most stable concepts", subtitle = "High Jaccard overlap in bootstrap")
+
+
 # Extract the matrix for the test bench
 word_vectors <- vectors_obj$vectors
+
+
+
 ```
 
 # Model comparison

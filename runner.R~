@@ -1,0 +1,105 @@
+# runner_scm.R
+
+# 1. SETUP
+library(here)
+library(tidyverse)
+library(DBI)
+library(RSQLite)
+library(text2vec)
+library(Matrix)
+library(igraph)
+
+# Load your config and library
+source(here::here("config.R"))
+source_lib("analysis_utils.R")
+source_lib("vectors.R")
+source_lib("topologies.R")
+source_lib("matrix.R")
+source_lib("graph_utils.R")
+source_lib("text_utils.R")
+
+# 2. LOAD CORPUS
+# (Assumes corpus_fiji_2005.sqlite exists in PATH_PROC)
+DB_PATH <- file.path(PATH_PROC, "corpus_fiji_2005.sqlite")
+
+if(!file.exists(DB_PATH)) stop("Database not found.")
+
+con <- dbConnect(SQLite(), DB_PATH)
+meta_df <- dbGetQuery(con, "SELECT doc_id, headline, date, author FROM doc_index") %>% as_tibble()
+tokens_df <- dbGetQuery(con, "SELECT t.doc_id, t.term, t.n FROM token_index t INNER JOIN doc_index d ON t.doc_id = d.doc_id") %>% as_tibble()
+content_df <- dbGetQuery(con, "SELECT doc_id, full_text FROM doc_content") %>% as_tibble()
+dbDisconnect(con)
+
+corpus <- create_corpus_object(tokens_df, meta_df)
+message(sprintf(">> Loaded: %d docs, %d terms", corpus$stats$n_docs, corpus$stats$n_terms))
+
+# 3. VECTORS (Generate or Load)
+VECTOR_PATH <- file.path(PATH_PROC, "vectors.rds")
+
+if(file.exists(VECTOR_PATH)) {
+  message(">> Loading cached vectors...")
+  vectors_obj <- readRDS(VECTOR_PATH)
+} else {
+  message(">> Generating NEW vectors (PPMI-SVD)...")
+  vectors_obj <- generate_corpus_vectors(
+    text_df = content_df %>% rename(text = full_text),
+    min_count = 5, window_size = 10, rank = 50
+  )
+  saveRDS(vectors_obj, VECTOR_PATH)
+}
+word_vectors <- vectors_obj$vectors
+
+# 4. BOOTSTRAP STABILITY (The "Endogenous" Check)
+# Define terms relevant to the Fiji 2005 context (adjust as needed)
+# We pick words that should have clear, specific semantic neighbors.
+specific_terms <- c("government", "military", "police", "budget", "election", "court", "fiji", "sugar")
+
+# Run stability test on THESE words
+content_stability <- test_embedding_stability(
+  text_df = content_df %>% rename(text = full_text), 
+  original_vectors = word_vectors,
+  vocab_stats = vectors_obj$stats,
+  n_iter = 5,
+  test_terms = specific_terms
+)
+
+print(content_stability)
+
+# 5. BUILD SCM MODEL (Low Threshold for App)
+message(">> Building SCM Graph (Threshold = 0.2)...")
+
+# A. Generate DTM (TF-IDF)
+dtm <- get_document_matrix(corpus, method = "tfidf")
+
+# B. Calculate SCM Similarity
+# (This uses your new SCM logic in compute_similarity)
+sim_scm <- compute_similarity(dtm, method = "scm", vectors = word_vectors)
+
+# C. Build Graph
+# We use a low threshold (0.2) to ensure the App has enough edges 
+# to filter dynamically using the "Backbone" slider.
+g_scm <- build_graph(sim_scm, threshold = 0.1) 
+
+# D. Clusters (for internal metrics)
+# We run a quick clustering to get density/modularity stats for the app's internal logic
+cluster_res <- analyze_clusters(g_scm, dtm, corpus, method = "scm", resolution = 1.0)
+
+# E. Vocab Stats (Entropy/Residuals) for the "Fruit Salad"
+vocab_stats <- calc_vocab_stats(dtm, similarity_threshold = 0.1)
+
+# 6. PACKAGE & SAVE FOR APP
+app_data <- list(
+  model_name = "Soft Cosine Measure (SCM)",
+  graph = g_scm,
+  dtm = dtm,
+  stats = vocab_stats,
+  meta = corpus$meta, 
+  full_text = setNames(content_df$full_text, content_df$doc_id),
+  clusters = cluster_res$metrics # Optional, if you want to visualize clusters later
+)
+
+saveRDS(app_data, file.path(PATH_APP, "model_current.rds"))
+message(">> SUCCESS. SCM Model saved.")
+
+# 7. LAUNCH APP
+message(">> Launching console app...")

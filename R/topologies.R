@@ -115,9 +115,14 @@ bootstrap_topology <- function(corpus, method = "tfidf", threshold = 0.2, n_iter
       sim <- text2vec::sim2(dtm, method = "cosine", norm = "l2")
       
     } else {
-      # Standard Sparse Methods
+      # Standard Sparse Methods & SCM
       dtm <- get_document_matrix(boot_corpus, method = method)
-      sim <- compute_similarity(dtm, method = ifelse(method=="binary", "jaccard", "cosine"))
+      
+      if (method == "scm") {
+        sim <- compute_similarity(dtm, method = "scm", vectors = vectors)
+      } else {
+        sim <- compute_similarity(dtm, method = ifelse(method=="binary", "jaccard", "cosine"))
+      }
     }
     
     # 4. Build Graph & Metrics
