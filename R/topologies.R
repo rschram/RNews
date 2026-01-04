@@ -283,7 +283,7 @@ perform_similarity_sweep <- function(corpus, vectors = NULL, method = "embedding
   }
   
   results_df <- bind_rows(results_list)
-  return(results_df)
+  return(results_df) 
 }
 
 #' Perform k-Nearest Neighbor (k-NN) Sweep for Percolation Analysis
