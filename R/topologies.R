@@ -285,3 +285,96 @@ perform_similarity_sweep <- function(corpus, vectors = NULL, method = "embedding
   results_df <- bind_rows(results_list)
   return(results_df)
 }
+
+#' Perform k-Nearest Neighbor (k-NN) Sweep for Percolation Analysis
+#' 
+#' @param corpus The corpus object containing $tokens and $meta.
+#' @param method The similarity method ("jaccard", "cosine", "tfidf").
+#' @param k_levels A numeric vector of k values to test (e.g., 1:20).
+#' @return A dataframe of topological metrics for each level of k.
+perform_knn_sweep <- function(corpus, method = "jaccard", k_levels = 1:20) {
+  
+  message(sprintf(">> Starting k-NN Sweep (%s) across k = %d to %d...", 
+                  method, min(k_levels), max(k_levels)))
+  
+  # 1. PRE-CALCULATE FULL SIMILARITY MATRIX
+  # For k-NN, we need the full ranked similarities for every document
+  dtm <- get_document_matrix(corpus, method = method)
+  
+  # Ensure we use Jaccard for binary similarity if method is set to 'jaccard'
+  sim_matrix <- compute_similarity(dtm, method = ifelse(method == "jaccard", "jaccard", "cosine"))
+  
+  # Remove self-loops (diagonal) so a node isn't its own neighbor
+  diag(sim_matrix) <- 0
+  
+  results_list <- list()
+  total_docs <- nrow(corpus$meta)
+  
+  # 2. RUN THE k-NN SWEEP
+  for (k in k_levels) {
+    
+    # A. BUILD k-NN ADJACENCY MATRIX
+    # For each row, keep only the top k similarities
+    adj <- matrix(0, nrow = nrow(sim_matrix), ncol = ncol(sim_matrix))
+    rownames(adj) <- rownames(sim_matrix)
+    colnames(adj) <- colnames(sim_matrix)
+    
+    for (i in 1:nrow(sim_matrix)) {
+      # Find indices of top k values
+      # Using 'partial' sort or order to handle the ranking
+      top_indices <- order(sim_matrix[i, ], decreasing = TRUE)[1:k]
+      adj[i, top_indices] <- sim_matrix[i, top_indices]
+    }
+    
+    # B. CREATE GRAPH
+    # Note: k-NN is inherently directed (A likes B, but B might not like A).
+    # We use mode = "max" to make it undirected (if either A or B is in top k, they link).
+    g <- graph_from_adjacency_matrix(adj, mode = "max", weighted = TRUE, diag = FALSE)
+    
+    # C. CONNECTIVITY & PERCOLATION METRICS
+    comps <- components(g)
+    giant_id <- which.max(comps$csize)
+    gcr <- max(comps$csize) / total_docs
+    
+    # In k-NN, survivors are usually 100% since every node gets k edges,
+    # but we check degree > 0 in case of empty documents
+    survivors <- sum(degree(g) > 0)
+    survivor_pct <- survivors / total_docs
+    
+    # D. MODULARITY (THE ARCHIPELAGO RESOLUTION)
+    leiden_comm <- cluster_leiden(g, objective_function = "modularity", 
+                                  weights = E(g)$weight, resolution_parameter = 1.0)
+    modularity_score <- modularity(g, membership(leiden_comm), weights = E(g)$weight)
+    n_modules <- length(unique(membership(leiden_comm)))
+    
+    # E. STRUCTURAL STRESS (CALCULATED ON GIANT COMPONENT)
+    giant_nodes <- names(comps$membership[comps$membership == giant_id])
+    
+    if (length(giant_nodes) > 2) {
+      g_giant <- induced_subgraph(g, giant_nodes)
+      avg_path <- mean_distance(g_giant, directed = FALSE)
+      
+      node_betw <- betweenness(g_giant, normalized = TRUE)
+      avg_betw <- mean(node_betw)
+      max_betw <- max(node_betw)
+    } else {
+      avg_path <- 0; avg_betw <- 0; max_betw <- 0
+    }
+    
+    # F. STORE RESULTS
+    results_list[[as.character(k)]] <- data.frame(
+      k = k,
+      GCR = gcr,
+      Modularity = modularity_score,
+      Survivor_Pct = survivor_pct,
+      Avg_Path = avg_path,
+      Avg_Betweenness = avg_betw,
+      Max_Betweenness = max_betw,
+      Cluster_Count = n_modules
+    )
+    
+    if (k %% 5 == 0) message(sprintf("   ...finished k = %d", k))
+  }
+  
+  return(bind_rows(results_list))
+}

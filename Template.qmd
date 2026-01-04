@@ -40,7 +40,16 @@ library(gt) # For nice tables
 ```{r, warning=FALSE, message=FALSE}
 DB_PATH <- file.path(PATH_PROC, "corpus_fiji_2005.sqlite")
 
-corpus_name <- "Test run"
+corpus_name <- "Fiji Times (2005)"
+
+in <- dbConnect(SQLite(), DB_PATH)
+ingest_proquest(file.path(PATH_RAW, "FT_AugSep2005.txt"), in, boilerplate_patterns = "<[^>]+>")
+ingest_proquest(file.path(PATH_RAW, "FT_Oct2005.txt"), in, boilerplate_patterns = "<[^>]+>")
+update_token_index(in, remove_stop_words = FALSE)
+
+dbDisconnect(in)
+
+
 
 # 1. Define the Loader Function (Custom for this analysis)
 load_corpus_from_sqlite <- function(db_path) {
@@ -87,68 +96,170 @@ if(file.exists(DB_PATH)) {
 
 The corpus *`r basename(corpus_name)`* contains **`r scales::comma(corpus$stats$n_docs)`** documents and a total of **`r scales::comma(corpus$stats$n_tokens)`** tokens. The average document length is `r round(corpus$stats$avg_doc_len, 2)` words.
 
-# Rank curves
-
 ```{r}
-# Calculate Rank-Order Distributions (Zipf, TF-IDF Mass, BM25)
-rank_data <- analyze_rank_curves(corpus)
-
-# Plot
-plot_rank_curves(rank_data)
+# # Calculate Rank-Order Distributions (Zipf, TF-IDF Mass, BM25)
+# rank_data <- analyze_rank_curves(corpus)
+# 
+# # Plot
+# plot_rank_curves(rank_data)
 ```
 
-# Term embeddings 
+# The document term matrix 
 
 ```{r}
-# Parameters
-MIN_COUNT   <- 5   # Ignore words appearing < 5 times
-WINDOW_SIZE <- 10  # Context window
-RANK        <- 50  # Dimensions (SVD Rank)
+# 2. Calculate Vocabulary Stats (Residual Entropy Model)
+message(">> Calculating Vocabulary Stats with Residual Entropy Gap...")
 
-# Generate (or Load if cached)
-VECTOR_PATH <- file.path(PATH_PROC, "vectors.rds")
+# We generate the DTM. 
+dtm <- get_document_matrix(corpus, method = "tfidf") 
 
-if(file.exists(VECTOR_PATH)) {
-  message(">> Loading cached vectors...")
-  vectors_obj <- readRDS(VECTOR_PATH)
-} else {
-  message(">> Generating new vectors...")
-  # We need the full text for sliding windows. 
-  # Ideally, we should pass the full text data frame here.
-  vectors_obj <- generate_corpus_vectors(
-    text_df = raw_data$content %>% rename(text = full_text),
-    min_count = MIN_COUNT,
-    window_size = WINDOW_SIZE,
-    rank = RANK
+# A. Basic Stats (Frequency & Raw Entropy)
+# ColSums on a sparse matrix is very fast and memory-efficient
+term_freqs <- Matrix::colSums(sparse_dtm)
+
+# Normalize columns to sum to 1 (Probabilities)
+# Multiplying by a Diagonal matrix is sparse-safe (O(N) complexity)
+inv_freq_diag <- Matrix::Diagonal(x = 1 / term_freqs)
+P_dt <- sparse_dtm %*% inv_freq_diag
+
+# Calculate Entropy in-place on the non-zero elements
+P_dt@x <- P_dt@x * log2(P_dt@x)
+H_t <- -Matrix::colSums(P_dt)
+
+vocab_stats <- data.frame(
+  Term = names(term_freqs),
+  Frequency = as.numeric(term_freqs),
+  Entropy = as.numeric(H_t)
+) %>%
+  filter(Frequency > 1) 
+
+# B. The Residual Model (The "Null Line")
+# We predict what the entropy SHOULD be for a word of this frequency.
+model_null <- lm(Entropy ~ poly(log10(Frequency), 3), data = vocab_stats)
+
+vocab_stats <- vocab_stats %>%
+  mutate(
+    Expected_Entropy = predict(model_null, .),
+    Residual = Entropy - Expected_Entropy,
+    
+    # Classify based on the Gap
+    # Residual < 0: Less random than expected (Bursty)
+    # Residual > 0: More random than expected (Generic)
+    Type = case_when(
+      Residual < 0 ~ "Bursty (High Info)",
+      Residual > 0 ~ "Generic (Low Info)",
+      TRUE ~ "Normal (Expected)"
+    )
   )
-  saveRDS(vectors_obj, VECTOR_PATH)
-}
 
-stability_report <- test_embedding_stability(
-  text_df = raw_data$content %>% rename(text = full_text), 
-  original_vectors = vectors_obj$vectors,
-  vocab_stats = vectors_obj$stats,
-  n_iter = 5 # Keep low for dev, 20 for paper
-)
-
-# Plot "Hall of Low Stability" (Most Unstable)
-stability_report %>%
-  head(15) %>%
-  gt() %>%
-  tab_header(title = "Least stable concepts", subtitle = "Low Jaccard overlap in bootstrap")
-
-# Plot "Hall of Stability" (Most Unstable)
-stability_report %>%
-  arrange(desc(stability_score)) %>%
-  head(15) %>%
-  gt() %>%
-  tab_header(title = "Most stable concepts", subtitle = "High Jaccard overlap in bootstrap")
+```
 
 
-# Extract the matrix for the test bench
-word_vectors <- vectors_obj$vectors
+
+# Document term matrix: Full and reduced
+
+```{r}
+# --- LEXICON SELECTION ---
+# Full Lexicon: The original 16,796 terms
+# Signal Lexicon: The 5,397 terms with Entropy_Gap < 0
+
+signal_terms <- vocab_stats %>% 
+  filter(Entropy_Gap < 0) %>% 
+  pull(Term)
+
+# Create two DTM versions
+dtm_full   <- dtm
+dtm_signal <- dtm[, signal_terms]
 
 
+```
+
+# Full and reduced compared
+
+```{r}
+# 3. Combine for plotting
+zipf_data <- bind_rows("???","???")
+
+# Generate the Plot
+p_zipf <- ggplot(zipf_data, aes(x = Rank, y = TF, color = Type)) +
+    # Use lines to show the curve
+    geom_line(size = 1.2, alpha = 0.8) +
+    
+    # Log-Log scales are essential for Zipf's Law
+    scale_x_log10(labels = scales::comma) +
+    scale_y_log10(labels = scales::comma) +
+    
+    scale_color_manual(values = c("Full Lexicon (16,796)" = "gray70", 
+                                  "Reduced Lexicon (5,397)" = "blue")) +
+    
+    theme_minimal() +
+    labs(
+        title = "Zipf's Law: Full vs. Reduced Lexicon",
+        subtitle = "Comparing the frequency distribution after removing 'Glue' (Positive Entropy Gap)",
+        x = "Rank (Log10 Scale)",
+        y = "Total Frequency (Log10 Scale)",
+        color = "Lexicon"
+    )
+
+# Save the diagnostic
+ggsave("diagnostic_zipf_comparison.png", p_zipf, width = 9, height = 6)
+print(p_zipf)
+```
+
+
+
+```{r}
+# Term embeddings 
+
+# # Parameters
+# MIN_COUNT   <- 5   # Ignore words appearing < 5 times
+# WINDOW_SIZE <- 10  # Context window
+# RANK        <- 50  # Dimensions (SVD Rank)
+# 
+# # Generate (or Load if cached)
+# VECTOR_PATH <- file.path(PATH_PROC, "vectors.rds")
+# 
+# if(file.exists(VECTOR_PATH)) {
+#   message(">> Loading cached vectors...")
+#   vectors_obj <- readRDS(VECTOR_PATH)
+# } else {
+#   message(">> Generating new vectors...")
+#   # We need the full text for sliding windows. 
+#   # Ideally, we should pass the full text data frame here.
+#   vectors_obj <- generate_corpus_vectors(
+#     text_df = raw_data$content %>% rename(text = full_text),
+#     min_count = MIN_COUNT,
+#     window_size = WINDOW_SIZE,
+#     rank = RANK
+#   )
+#   saveRDS(vectors_obj, VECTOR_PATH)
+# }
+# 
+# stability_report <- test_embedding_stability(
+#   text_df = raw_data$content %>% rename(text = full_text), 
+#   original_vectors = vectors_obj$vectors,
+#   vocab_stats = vectors_obj$stats,
+#   n_iter = 5 # Keep low for dev, 20 for paper
+# )
+# 
+# # Plot "Hall of Low Stability" (Most Unstable)
+# stability_report %>%
+#   head(15) %>%
+#   gt() %>%
+#   tab_header(title = "Least stable concepts", subtitle = "Low Jaccard overlap in bootstrap")
+# 
+# # Plot "Hall of Stability" (Most Unstable)
+# stability_report %>%
+#   arrange(desc(stability_score)) %>%
+#   head(15) %>%
+#   gt() %>%
+#   tab_header(title = "Most stable concepts", subtitle = "High Jaccard overlap in bootstrap")
+# 
+# 
+# # Extract the matrix for the test bench
+# word_vectors <- vectors_obj$vectors
+# 
+# 
 
 ```
 
@@ -398,63 +509,4 @@ winner$clusters %>%
   )
 ```
 
-```{r}
-# 2. Calculate Vocabulary Stats (Residual Entropy Model)
-message(">> Calculating Vocabulary Stats with Residual Entropy Gap...")
 
-# We generate the DTM. 
-# Note: We use TF-IDF because it is useful for the App's search relevance later.
-# For Entropy, the IDF constant cancels out during normalization, so this is mathematically safe.
-sparse_dtm <- get_document_matrix(corpus, method = "tfidf") 
-
-# A. Basic Stats (Frequency & Raw Entropy)
-# ColSums on a sparse matrix is very fast and memory-efficient
-term_freqs <- Matrix::colSums(sparse_dtm)
-
-# Normalize columns to sum to 1 (Probabilities)
-# Multiplying by a Diagonal matrix is sparse-safe (O(N) complexity)
-inv_freq_diag <- Matrix::Diagonal(x = 1 / term_freqs)
-P_dt <- sparse_dtm %*% inv_freq_diag
-
-# Calculate Entropy in-place on the non-zero elements
-P_dt@x <- P_dt@x * log2(P_dt@x)
-H_t <- -Matrix::colSums(P_dt)
-
-vocab_stats <- data.frame(
-  Term = names(term_freqs),
-  Frequency = as.numeric(term_freqs),
-  Entropy = as.numeric(H_t)
-) %>%
-  filter(Frequency > 1) 
-
-# B. The Residual Model (The "Null Line")
-# We predict what the entropy SHOULD be for a word of this frequency.
-model_null <- lm(Entropy ~ poly(log10(Frequency), 3), data = vocab_stats)
-
-vocab_stats <- vocab_stats %>%
-  mutate(
-    Expected_Entropy = predict(model_null, .),
-    Residual = Entropy - Expected_Entropy,
-    
-    # Classify based on the Gap
-    # Residual < 0: Less random than expected (Bursty)
-    # Residual > 0: More random than expected (Generic)
-    Type = case_when(
-      Residual < -0.5 ~ "Bursty (High Info)",
-      Residual > 0.5 ~ "Generic (Low Info)",
-      TRUE ~ "Normal (Expected)"
-    )
-  )
-
-# C. Package & Save
-app_data <- list(
-  model_name = CHOSEN_MODEL,
-  graph = winner$graph,
-  dtm = sparse_dtm,
-  stats = vocab_stats,
-  full_text = setNames(raw_data$content$full_text, raw_data$content$doc_id)
-)
-
-saveRDS(app_data, file.path(PATH_APP, "model_current.rds"))
-message(">> SUCCESS. Model saved with Entropy Residuals.")
-```

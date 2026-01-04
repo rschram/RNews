@@ -18,25 +18,50 @@ available_clusters <- available_clusters[available_clusters != 0]
 
 ui <- fluidPage(
   tags$head(
+    # 1. CSS for Blending & Selection
     tags$style("
-      .hl-base { padding: 0 1px; border-radius: 3px; }
-      :root {
-        --bursty-rgb: 46, 204, 113;
-        --bridge-rgb: 241, 196, 15;
-        --shared-rgb: 155, 89, 182;
-        --cluster-rgb: 52, 152, 219; 
-      }
-      .hl-bursty { background-color: rgba(var(--bursty-rgb), var(--opacity)); }
-      .hl-bridge { background-color: rgba(var(--bridge-rgb), var(--opacity)); }
-      .hl-shared { background-color: rgba(var(--shared-rgb), var(--opacity)); }
-      .hl-cluster { background-color: rgba(var(--cluster-rgb), var(--opacity)); }
+      /* Token Base */
+      .tok { cursor: text; border-radius: 2px; padding: 0 1px; }
       
-      .doc-box { border: 1px solid #ddd; padding: 20px; height: 75vh; overflow-y: auto; background: white; }
-      .comp-col { padding: 0 5px; }
-      .cluster-scroll {
-        max-height: 150px; overflow-y: auto; border: 1px solid #eee; padding: 5px; background: #f9f9f9;
-      }
-      .note-box { background: #fff3cd; padding: 10px; margin-bottom: 10px; border-left: 5px solid #ffecb5; }
+      /* Visual Layers (Blending Strategy) */
+      .hl-bursty { background-color: rgba(46, 204, 113, 0.25); border-bottom: 2px solid rgba(46, 204, 113, 1); }
+      .hl-bridge { box-shadow: 0 2px 0 rgba(241, 196, 15, 0.8) inset; } /* Inset shadow prevents layout shifts */
+      .hl-shared { border: 1px solid rgba(155, 89, 182, 0.6); }
+      .hl-query  { background-color: rgba(255, 255, 0, 0.4); font-weight: bold; }
+      
+      /* User Annotation Selection (Temporary Visual) */
+      .user-select { background-color: #ffe082 !important; outline: 1px dashed #f39c12; }
+      
+      /* Layout */
+      .doc-box { border: 1px solid #ddd; padding: 20px; height: 75vh; overflow-y: auto; background: white; font-family: 'Georgia', serif; line-height: 1.6; }
+      .note-box { background: #fff3cd; padding: 8px; margin-bottom: 8px; border-left: 4px solid #ffecb5; font-size: 0.9em; }
+    "),
+    
+    # 2. JavaScript Selection Handler
+    tags$script("
+      $(document).on('mouseup', '.doc-box', function() {
+        var sel = window.getSelection();
+        if(sel.rangeCount > 0 && !sel.isCollapsed) {
+          var range = sel.getRangeAt(0);
+          
+          // Find strictly the token spans inside the selection
+          // (We use jQuery to find the closest .tok class to the start/end of selection)
+          var startNode = $(range.startContainer).closest('.tok');
+          var endNode = $(range.endContainer).closest('.tok');
+          
+          if(startNode.length && endNode.length) {
+            var startId = startNode.attr('id'); // e.g. 'p1-t4'
+            var endId = endNode.attr('id');     // e.g. 'p1-t8'
+            
+            // Send to Shiny
+            Shiny.setInputValue('current_selection', {
+              start: startId, 
+              end: endId, 
+              text: sel.toString()
+            }, {priority: 'event'});
+          }
+        }
+      });
     ")
   ),
   
@@ -46,6 +71,7 @@ ui <- fluidPage(
     sidebarPanel(
       width = 3,
       textInput("search", "Search Terms"),
+      checkboxInput("show_search_highlights", "Highlight Search Terms", value = TRUE),
       hr(),
       h4("Map Layers"),
       checkboxInput("show_bursty", "Entropy (Burstiness)", value = FALSE),
@@ -161,25 +187,48 @@ server <- function(input, output, session) {
   
   # --- 3. ANNOTATION ---
   
+  # --- 3. ANNOTATION LOGIC (UPDATED) ---
+  
+  # A. Listen for Selection
+  observeEvent(input$current_selection, {
+    sel <- input$current_selection
+    # Optional: You could show a UI feedback here, like "Selection: p1-t4 to p1-t8"
+    updateTextAreaInput(session, "note_input", 
+                        label = paste0("Add Note to selection (", substr(sel$text, 1, 20), "...)"),
+                        placeholder = "Type your insight here...")
+  })
+  
+  # B. Save Note with Coordinates
   observeEvent(input$save_note, {
     ids <- input$compare_ids
     if(length(ids) == 0) return()
     
-    # Save to the FIRST active document (or Single View doc)
-    target_id <- ids[1]
+    # If user has made a text selection, use those coords. Otherwise, default to "Doc Level"
+    sel <- input$current_selection
+    
+    # Simple check: Is the selection recent/valid? (You might want to reset this after saving)
+    has_selection <- !is.null(sel) && nzchar(sel$start)
     
     new_entry <- data.frame(
-      doc_id = target_id,
+      doc_id = ids[1], # Attach to the first active doc
+      start_token = if(has_selection) sel$start else NA,
+      end_token   = if(has_selection) sel$end else NA,
+      highlight_text = if(has_selection) sel$text else NA,
       note = input$note_input,
-      timestamp = as.character(Sys.time())
+      timestamp = as.character(Sys.time()),
+      stringsAsFactors = FALSE
     )
     
+    # Save (Append to CSV)
     write_csv(new_entry, NOTE_PATH, append = TRUE)
-    notes_data(read_csv(NOTE_PATH, show_col_types = FALSE)) # Refresh
-    updateTextAreaInput(session, "note_input", value = "")
-    showNotification("Note saved!", type = "message")
+    
+    # Refresh
+    notes_data(read_csv(NOTE_PATH, show_col_types = FALSE))
+    updateTextAreaInput(session, "note_input", value = "", label = "Add Note to Active Doc")
+    showNotification("Annotation saved!", type = "message")
   })
   
+  # C. Display Notes (Updated to show context)
   get_doc_notes <- function(id) {
     df <- notes_data()
     if(nrow(df) == 0) return("")
@@ -187,28 +236,57 @@ server <- function(input, output, session) {
     doc_notes <- df %>% filter(doc_id == id) %>% arrange(desc(timestamp))
     if(nrow(doc_notes) == 0) return("")
     
-    items <- paste0("<li>", doc_notes$note, " <small class='text-muted'>(", doc_notes$timestamp, ")</small></li>", collapse="")
-    paste0("<div class='note-box'><ul>", items, "</ul></div>")
+    # Format: "Note text" (quoted text if available)
+    items <- apply(doc_notes, 1, function(row) {
+      context <- if(!is.na(row['highlight_text'])) paste0("<br><i>Ref: \"", substr(row['highlight_text'], 1, 50), "...\"</i>") else ""
+      paste0("<li><b>", row['note'], "</b>", context, "</li>")
+    })
+    
+    paste0("<div class='note-box'><ul>", paste(items, collapse=""), "</ul></div>")
   }
   
   # --- 4. VIEWS ---
+  get_doc_tokens <- function(id) {
+    # Open discrete connection or use global pool
+    local_con <- dbConnect(RSQLite::SQLite(), here::here("data", "processed", "corpus_fiji_2005.sqlite"))
+    on.exit(dbDisconnect(local_con))
+    
+    # Fetch tokens sorted by position
+    dbGetQuery(local_con, paste0("SELECT * FROM doc_tokens WHERE doc_id = '", id, "' ORDER BY para_id, token_id"))
+  }
   
   output$single_view <- renderUI({
     ids <- input$compare_ids
     if(length(ids) == 0) return(h4("Select a document."))
     
     id <- ids[1]
-    txt <- unname(model$full_text[id]) # UNNAME FIXES VCTRS ERROR
-    print("--- DEBUG: Data Structure ---")
-    str(txt) # Replace with the actual variable name passed to the highlighter
-    str(get_groups(id)) # Replace with the actual dictionary/term variable
-    hl_html <- highlight_fruit_salad_x(txt, get_groups(id))
+    raw_txt <- unname(model$full_text[id])
     
-    div(class="doc-box",
-        HTML(get_doc_notes(id)),
-        h2(model$meta$headline[model$meta$doc_id == id]),
-        HTML(gsub("\n", "<br>", hl_html))
-    )
+    # 1. Fetch Positional Data
+    tokens <- get_doc_tokens(id)
+    
+    # 2. Get Highlights
+    # (Assuming your existing get_groups function now returns list(query=..., bursty=...))
+    groups <- get_groups(id)
+    
+    # 3. Add Query to Groups (Conditional)
+    if(isTruthy(input$search) && isTRUE(input$show_search_highlights)) {
+      groups$query <- c(input$search)
+    }
+    
+    # 4. Render
+    if(nrow(tokens) == 0) {
+      # Fallback if doc wasn't indexed yet
+      HTML(paste("<div class='alert alert-warning'>Positional index missing.</div>", gsub("\n", "<br>", raw_txt)))
+    } else {
+      html_content <- render_blended_document(raw_txt, tokens, groups)
+      
+      div(class="doc-box",
+          HTML(get_doc_notes(id)), # Existing note logic
+          h2(model$meta$headline[model$meta$doc_id == id]),
+          HTML(html_content)
+      )
+    }
   })
   
   output$compare_view <- renderUI({
@@ -217,16 +295,31 @@ server <- function(input, output, session) {
     
     # Dynamic Columns
     cols <- lapply(ids, function(id) {
-      txt <- unname(model$full_text[id]) # UNNAME FIXES VCTRS ERROR
+      raw_txt <- unname(model$full_text[id])
       
-      # Pass ALL ids to get_groups to calculate intersection correctly
-      hl_html <- highlight_fruit_salad_x(txt, get_groups(id, ids))
+      # 1. Fetch Tokens
+      tokens <- get_doc_tokens(id)
+      
+      # 2. Get Groups (Passing 'ids' ensures shared terms are calculated)
+      groups <- get_groups(id, ids)
+      
+      # 3. Add Search Query Highlight
+      if(isTruthy(input$search) && isTRUE(input$show_search_highlights)) { 
+          groups$query <- c(input$search)
+      }
+      # 4. Render with Blending
+      if(nrow(tokens) == 0) {
+        # Fallback if positional index is missing
+        html_content <- paste("<div class='alert alert-warning'>Positional index missing.</div>", gsub("\n", "<br>", raw_txt))
+      } else {
+        html_content <- render_blended_document(raw_txt, tokens, groups)
+      }
       
       column(width = floor(12 / length(ids)), class="comp-col",
              div(class="doc-box",
                  HTML(get_doc_notes(id)),
                  h4(model$meta$headline[model$meta$doc_id == id]),
-                 HTML(gsub("\n", "<br>", hl_html))
+                 HTML(html_content)
              )
       )
     })
@@ -234,40 +327,67 @@ server <- function(input, output, session) {
     do.call(fluidRow, cols)
   })
   
-  # --- 5. EXPORT ---
+  # --- 5. EXPORT (QUARTO READY) ---
   
   output$download_view <- downloadHandler(
-    filename = function() { paste0("view_export_", Sys.Date(), ".html") },
+    filename = function() { paste0("exported_view_", Sys.Date(), ".html") },
     content = function(file) {
       ids <- input$compare_ids
       if(length(ids) == 0) return()
       
-      # Generate content based on current selection
-      divs <- lapply(ids, function(id) {
-        txt <- unname(model$full_text[id])
-        hl_html <- highlight_fruit_salad_x(txt, get_groups(id, if(length(ids)>1) ids else NULL))
-        notes <- get_doc_notes(id)
-        paste0("<div style='flex:1; padding:10px; border:1px solid #ccc; margin:5px;'>",
-               notes, "<h2>", model$meta$headline[model$meta$doc_id == id], "</h2>",
-               gsub("\n", "<br>", hl_html), "</div>")
+      # 1. Generate the HTML Content exactly as seen
+      # We re-run the render function to get the clean HTML
+      content_divs <- lapply(ids, function(id) {
+        # Fetch tokens/groups (reusing your server helpers)
+        tokens <- get_doc_tokens(id)
+        groups <- get_groups(id, ids)
+        if(isTruthy(input$search)) groups$query <- c(input$search)
+        
+        raw_txt <- unname(model$full_text[id])
+        hl_html <- render_blended_document(raw_txt, tokens, groups)
+        notes   <- get_doc_notes(id)
+        
+        paste0(
+          "<div class='export-doc'>",
+          "<div class='meta'>",
+          "<h2>", model$meta$headline[model$meta$doc_id == id], "</h2>",
+          "<p class='byline'>", model$meta$date[model$meta$doc_id == id], " | ", model$meta$author[model$meta$doc_id == id], "</p>",
+          "</div>",
+          "<div class='notes'>", notes, "</div>",
+          "<div class='body'>", hl_html, "</div>",
+          "</div>"
+        )
       })
       
-      body_content <- paste0("<div style='display:flex; flex-wrap:wrap;'>", paste(divs, collapse=""), "</div>")
+      # 2. Embed the CSS (Critical for static Quarto figures)
+      # We embed the EXACT same CSS classes used in the app
+      css_block <- "
+        <style>
+          body { font-family: 'Georgia', serif; font-size: 14px; line-height: 1.6; color: #333; }
+          .export-doc { border: 1px solid #ccc; padding: 20px; margin-bottom: 20px; background: #fff; }
+          .byline { color: #666; font-style: italic; margin-bottom: 20px; }
+          .notes { background: #f9f9f9; padding: 10px; border-left: 4px solid #333; margin-bottom: 20px; }
+          
+          /* The Blending Classes */
+          .tok { padding: 0 1px; }
+          .hl-bursty { background-color: rgba(46, 204, 113, 0.3); }
+          .hl-bridge { box-shadow: 0 2px 0 rgba(241, 196, 15, 0.8); }
+          .hl-shared { border: 1px solid rgba(155, 89, 182, 0.6); }
+          .hl-query  { background-color: rgba(255, 255, 0, 0.5); font-weight: bold; }
+        </style>
+      "
       
-      html <- paste0(
-        "<html><head><style>",
-        ".hl-base { border-radius: 3px; }",
-        ".hl-bursty { background-color: rgba(46, 204, 113, var(--opacity)); }",
-        ".hl-bridge { background-color: rgba(241, 196, 15, var(--opacity)); }",
-        ".hl-shared { background-color: rgba(155, 89, 182, var(--opacity)); }",
-        ".hl-cluster { background-color: rgba(52, 152, 219, var(--opacity)); }",
-        ".note-box { background: #fff3cd; padding: 10px; border: 1px solid #ffeeba; }",
-        "body { font-family: sans-serif; }",
-        "</style></head><body><h1>Exported View</h1>", body_content, "</body></html>"
+      # 3. Assemble
+      full_html <- paste0(
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>", css_block, "</head><body>",
+        paste(content_divs, collapse="\n"),
+        "</body></html>"
       )
-      writeLines(html, file)
+      
+      writeLines(full_html, file)
     }
   )
 }
+
 
 shinyApp(ui, server)

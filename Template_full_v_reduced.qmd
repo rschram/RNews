@@ -1,0 +1,645 @@
+---
+title: "Paper template"
+author: "Research Team"
+format: 
+  html:
+    toc: true
+    code-fold: true
+    df-print: kable
+editor: source
+execute: 
+  warning: false
+  message: false
+---
+
+## 1. Environment Setup
+
+We initialize the project environment using the rigorous path controls defined in `config.R`.
+
+```{r setup, message=FALSE, warning=FALSE}
+# 1. Load Project Configuration (The Source of Truth)
+library(here)
+source(here::here("config.R"))
+
+# 2. Load Local Function Library
+# We use the source_lib helper from config.R to ensure paths are correct
+source_lib("analysis_utils.R")
+source_lib("vectors.R")
+source_lib("topologies.R")
+source_lib("matrix.R")
+source_lib("graph_utils.R")
+source_lib("text_utils.R")
+
+# 3. Libraries
+library(tidyverse)
+library(DBI)
+library(RSQLite)
+library(gt) # For nice tables
+library(quanteda)
+```
+
+```{r, warning=FALSE, message=FALSE}
+DB_PATH <- file.path(PATH_PROC, "corpus_fiji_2005.sqlite")
+
+corpus_name <- "Fiji Times (2005)"
+
+con <- dbConnect(SQLite(), DB_PATH)
+ingest_proquest(file.path(PATH_RAW, "FT_AugSep2005.txt"), con, boilerplate_patterns = "<[^>]+>")
+ingest_proquest(file.path(PATH_RAW, "FT_Oct2005.txt"), con, boilerplate_patterns = "<[^>]+>")
+update_token_index(con, remove_stop_words = FALSE)
+
+dbDisconnect(con)
+
+
+
+# 1. Define the Loader Function (Custom for this analysis)
+load_corpus_from_sqlite <- function(db_path) {
+  con <- dbConnect(SQLite(), db_path)
+  on.exit(dbDisconnect(con))
+  
+  # A. Get Metadata
+  # Modify this query if you need to filter specific dates/authors
+  meta_df <- dbGetQuery(con, "SELECT doc_id, headline, date, author FROM doc_index") %>%
+    as_tibble()
+  
+  # B. Get Token Counts
+  # We join with doc_index to ensure we only get tokens for the filtered docs
+  tokens_df <- dbGetQuery(con, "
+    SELECT t.doc_id, t.term, t.n 
+    FROM token_index t
+    INNER JOIN doc_index d ON t.doc_id = d.doc_id
+  ") %>%
+    as_tibble()
+  
+  # C. Get Full Text (Optional, needed for App export later)
+  content_df <- dbGetQuery(con, "SELECT doc_id, full_text FROM doc_content") %>%
+    as_tibble()
+  
+  list(meta = meta_df, tokens = tokens_df, content = content_df)
+}
+
+# 2. Execute Load
+if(file.exists(DB_PATH)) {
+  raw_data <- load_corpus_from_sqlite(DB_PATH)
+  
+  # 3. Create Standard Corpus Object
+  # This calculates Global TF, IDF, and stats immediately
+  corpus <- create_corpus_object(raw_data$tokens, raw_data$meta)
+  
+  message(sprintf("Loaded Corpus: %d documents, %d unique terms.", 
+                  corpus$stats$n_docs, corpus$stats$n_terms))
+} else {
+  stop("Database not found! Please run ingestion.")
+}
+
+
+
+
+```
+
+# Corpus stats
+
+The corpus *`r basename(corpus_name)`* contains **`r scales::comma(corpus$stats$n_docs)`** documents and a total of **`r scales::comma(corpus$stats$n_tokens)`** tokens. The average document length is `r round(corpus$stats$avg_doc_len, 2)` words.
+
+
+# The document term matrix 
+
+```{r}
+# 2. Calculate Vocabulary Stats (Residual Entropy Model)
+message(">> Calculating Vocabulary Stats with Residual Entropy Gap...")
+
+# We generate the DTM. 
+dtm <- get_document_matrix(corpus, method = "tfidf") 
+
+# A. Basic Stats (Frequency & Raw Entropy)
+# ColSums on a sparse matrix is very fast and memory-efficient
+term_freqs <- Matrix::colSums(dtm)
+
+# Normalize columns to sum to 1 (Probabilities)
+# Multiplying by a Diagonal matrix is sparse-safe (O(N) complexity)
+inv_freq_diag <- Matrix::Diagonal(x = 1 / term_freqs)
+P_dt <- dtm %*% inv_freq_diag
+
+# Calculate Entropy in-place on the non-zero elements
+P_dt@x <- P_dt@x * log2(P_dt@x)
+H_t <- -Matrix::colSums(P_dt)
+
+vocab_stats <- data.frame(
+  Term = names(term_freqs),
+  Frequency = as.numeric(term_freqs),
+  Entropy = as.numeric(H_t)
+) %>%
+  filter(Frequency > 1) 
+
+# B. The Residual Model (The "Null Line")
+# We predict what the entropy SHOULD be for a word of this frequency.
+model_null <- lm(Entropy ~ poly(log10(Frequency), 3), data = vocab_stats)
+
+vocab_stats <- vocab_stats %>%
+  mutate(
+    Expected_Entropy = predict(model_null, .),
+    Entropy_Gap = Entropy - Expected_Entropy,
+    
+    # Classify based on the Gap
+    # Entropy_Gap < 0: Less random than expected (Bursty)
+    # Entropy_Gap > 0: More random than expected (Generic)
+    Type = case_when(
+      Entropy_Gap < 0 ~ "Bursty (High Info)",
+      Entropy_Gap > 0 ~ "Generic (Low Info)",
+      TRUE ~ "Normal (Expected)"
+    )
+  )
+
+
+# 1. Identify the Signal Lexicon (from your previous analysis)
+signal_terms <- vocab_stats %>% 
+  filter(Entropy_Gap < 0) %>% 
+  pull(Term)
+
+# 2. Tokenize the full corpus
+toks_full <- tokens(corpus) 
+
+# 3. Create a Reduced Token object (The "Signal-Only" version)
+# This physically removes all "Glue" tokens from the text streams
+toks_signal <- tokens_select(toks_full, pattern = signal_terms, selection = "keep")
+
+tokens_reduced <- raw_data$tokens %>%
+  filter(term %in% signal_terms)
+
+corpus_signal <- create_corpus_object(tokens_reduced, raw_data$meta)
+
+# 4. Verify the results
+message(sprintf("Full Corpus: %d terms", corpus$stats$n_terms))
+message(sprintf("Reduced Corpus: %d terms", corpus_signal$stats$n_terms))
+
+```
+
+
+# Full and reduced lexicons compared
+
+```{r}
+# 1. Prepare dynamic labels to ensure consistency
+flex_label <- sprintf("Full lexicon (%s terms)", scales::comma(corpus$stats$n_terms)) 
+rlex_label <- sprintf("Reduced lexicon (%s terms)", scales::comma(corpus_signal$stats$n_terms))
+
+# 2. Calculate ranks using these specific labels
+full_zipf <- vocab_stats %>%
+  arrange(desc(Frequency)) %>%
+  mutate(Rank = row_number(), TF = Frequency, Type = flex_label)
+
+reduced_zipf <- vocab_stats %>%
+  filter(Entropy_Gap < 0) %>%
+  arrange(desc(Frequency)) %>%
+  mutate(Rank = row_number(), TF = Frequency, Type = rlex_label)
+
+# 3. Combine
+zipf_data <- bind_rows(reduced_zipf, full_zipf)
+
+# Generate the Plot with adjusted alpha (opacity)
+p_zipf <- ggplot(zipf_data, aes(x = Rank, y = TF, color = Type)) +
+    # Use a low alpha for the Gray background line and a high alpha for the Blue foreground
+    geom_line(aes(alpha = Type), size = 1.2) +
+    
+    # Manually define the alpha values
+    scale_alpha_manual(values = setNames(c(1, 0.3), c(flex_label, rlex_label))) +
+    
+    # Keep your existing scales
+    scale_x_log10(labels = scales::comma) +
+    scale_y_log10(labels = scales::comma) +
+    scale_color_manual(values = setNames(c("gray70", "blue"), c(flex_label, rlex_label))) +
+    
+    theme_minimal() +
+    guides(alpha = "none") + # Hide the alpha legend, keep the color legend
+    labs(
+        title = "Zipf's Law: Structural Overlap",
+        subtitle = "Gray = Total Vocabulary | Blue = Information-Bearing Signal",
+        x = "Rank (Log10)",
+        y = "Frequency (Log10)"
+    )
+
+p_zipf
+```
+
+
+
+# Model comparison: Full lexicon
+
+```{r}
+# Run the Suite (This calls run_test_bench -> bootstrap_topology)
+# boot_iter = 30 is good for testing, increase to 100 for final paper
+suite_full <- run_model_suite(
+  corpus = corpus, 
+  threshold = SIM_THRESHOLD, # Defined in config.R (e.g., 0.3)
+  boot_iter = 20
+)
+
+# Show the Comparison Table
+suite_full$comparison %>%
+  # 1. Select the relevant statistics
+  select(Method, ends_with("_mean"), ends_with("_ci_low"), ends_with("_ci_high")) %>%
+  
+  # 2. Pivot longer to handle all metrics dynamically
+  pivot_longer(
+    cols = -Method, 
+    names_to = c("metric", "stat"), 
+    names_pattern = "^(.*)_(mean|ci_low|ci_high)$"
+  ) %>%
+  
+  # 3. Pivot wider to align Mean, Low, and High for calculation
+  pivot_wider(names_from = stat, values_from = value) %>%
+  
+  # 4. Calculate Margin and Identify the "Best" (Narrowest CI)
+  mutate(
+    margin = (ci_high - ci_low) / 2
+  ) %>%
+  group_by(metric) %>%
+  mutate(
+    is_best_ci = margin == min(margin) # Find smallest margin in this group
+  ) %>%
+  ungroup() %>%
+
+  # 5. Create the combined display string: "Mean ± Margin"
+  mutate(
+    # If best: Bold text, Black color. If not: Normal text, Grey color.
+    ci_style_open = ifelse(is_best_ci, "<span style='font-weight:bold; color:#000;'>", "<span style='color:#666;'>"),
+    
+    display_value = sprintf("%.3f <br><span style='font-size:0.8em;'>%s± %.3f</span></span>", 
+                            mean, ci_style_open, margin)
+  ) %>%
+  
+  # 6. Clean up metric names
+  mutate(metric = str_to_title(str_replace_all(metric, "_", " "))) %>%
+  
+  # 7. Pivot back to wide format for the final table
+  select(Method, metric, display_value) %>%
+  pivot_wider(names_from = metric, values_from = display_value) %>%
+  
+  # 8. Render with GT
+  gt() %>%
+  fmt_markdown(columns = -Method) %>% 
+  tab_header(
+    title = "Model stability comparison (Bootstrapped, Full lexicon)",
+    subtitle = "Values shown as: Mean ± Margin of Error (95% CI)"
+  ) %>%
+  cols_align(align = "center", columns = -Method) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) %>%
+  tab_footnote(
+    footnote = "Bold values indicate the most stable model (narrowest CI) for that metric."
+  )
+
+```
+
+
+# Model comparison: Full lexicon
+
+```{r}
+# Run the Suite (This calls run_test_bench -> bootstrap_topology)
+# boot_iter = 30 is good for testing, increase to 100 for final paper
+suite_reduced <- run_model_suite(
+  corpus = corpus_signal, 
+  threshold = SIM_THRESHOLD, # Defined in config.R (e.g., 0.3)
+  boot_iter = 20
+)
+
+# Show the Comparison Table
+suite_reduced$comparison %>%
+  # 1. Select the relevant statistics
+  select(Method, ends_with("_mean"), ends_with("_ci_low"), ends_with("_ci_high")) %>%
+  
+  # 2. Pivot longer to handle all metrics dynamically
+  pivot_longer(
+    cols = -Method, 
+    names_to = c("metric", "stat"), 
+    names_pattern = "^(.*)_(mean|ci_low|ci_high)$"
+  ) %>%
+  
+  # 3. Pivot wider to align Mean, Low, and High for calculation
+  pivot_wider(names_from = stat, values_from = value) %>%
+  
+  # 4. Calculate Margin and Identify the "Best" (Narrowest CI)
+  mutate(
+    margin = (ci_high - ci_low) / 2
+  ) %>%
+  group_by(metric) %>%
+  mutate(
+    is_best_ci = margin == min(margin) # Find smallest margin in this group
+  ) %>%
+  ungroup() %>%
+
+  # 5. Create the combined display string: "Mean ± Margin"
+  mutate(
+    # If best: Bold text, Black color. If not: Normal text, Grey color.
+    ci_style_open = ifelse(is_best_ci, "<span style='font-weight:bold; color:#000;'>", "<span style='color:#666;'>"),
+    
+    display_value = sprintf("%.3f <br><span style='font-size:0.8em;'>%s± %.3f</span></span>", 
+                            mean, ci_style_open, margin)
+  ) %>%
+  
+  # 6. Clean up metric names
+  mutate(metric = str_to_title(str_replace_all(metric, "_", " "))) %>%
+  
+  # 7. Pivot back to wide format for the final table
+  select(Method, metric, display_value) %>%
+  pivot_wider(names_from = metric, values_from = display_value) %>%
+  
+  # 8. Render with GT
+  gt() %>%
+  fmt_markdown(columns = -Method) %>% 
+  tab_header(
+    title = "Model stability comparison (Bootstrapped, Reduced lexicon)",
+    subtitle = "Values shown as: Mean ± Margin of Error (95% CI)"
+  ) %>%
+  cols_align(align = "center", columns = -Method) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) %>%
+  tab_footnote(
+    footnote = "Bold values indicate the most stable model (narrowest CI) for that metric."
+  )
+
+```
+
+
+
+# The percolation event: Full lexicon
+
+```{r}
+### 6. Phase Transition Analysis (The "Sweep")
+
+# A. Calculate the Sweep Data
+# We use the parameters from your "winning" model choice.
+# Ensure 'vectors' are loaded if using an embedding method.
+sweep_results <- perform_similarity_sweep(
+  corpus = corpus,
+  method = "tf", # CHANGE THIS to match your winning method code (e.g. "tfidf", "bm25")
+  thresholds = seq(0.05, 1, 0.05)
+)
+
+# B. Plot the Phase Transition
+# We need to scale the "Cluster Count" to fit on the 0-1 axis for visualization,
+# then add a secondary axis labels to show the true count.
+scale_factor <- max(sweep_results$Cluster_Count, na.rm=TRUE)
+
+my_colors <- c(
+  "Giant Component Ratio (GCR)"             = "black",        # The anchor metric
+  "Modularity"                              = "firebrick3",   # High contrast
+  "Structural stress (Average betweenness)" = "royalblue4",   # Deep blue
+  "Bridge strength (Maximum betweenness)"   = "darkcyan",     # Distinct from blue
+  "Survivors (%)"                           = "darkorchid4",  # Warm but dark
+  "Cluster count"                           = "darkorange2"   # Visible orange instead of yellow
+)
+
+ggplot(sweep_results, aes(x = Threshold)) +
+  
+  # 1. Global Metrics (Solid Lines)
+  geom_line(aes(y = GCR, color = "Giant Component Ratio (GCR)"), size = 1) +
+  geom_line(aes(y = Modularity, color = "Modularity"), size = 1) +
+  geom_line(aes(y = Avg_Betweenness, color = "Structural stress (Average betweenness)"), size = 1) +
+  geom_line(aes(y = Max_Betweenness, color = "Bridge strength (Maximum betweenness)"), size = 1) +
+  
+  # 2. Survivors (Dashed Line)
+  geom_line(aes(y = Survivor_Pct, color = "Survivors (%)"), linetype = "dashed", size = 1) +
+  
+  # 3. Cluster Count (Dotted Line, Scaled)
+  geom_line(aes(y = Cluster_Count / scale_factor, color = "Cluster count"), linetype = "dotted", size = 1.2) +
+  
+  # 4. Axes & Scales
+  scale_y_continuous(
+    name = "Normalized Metrics (0-1)",
+    limits = c(0, 1),
+    # Add secondary axis for the raw cluster count
+    sec.axis = sec_axis(~ . * scale_factor, name = "Number of Clusters (Dotted)")
+  ) +
+  
+  # 5. Styling
+  scale_color_manual(values = my_colors) +  theme_minimal() +
+  labs(
+    title = "Network Phase Transition Sweep",
+    subtitle = "Solid = Structure; Dashed = Survivors; Dotted = Cluster count",
+    x = "Similarity Threshold",
+    color = "Metric"
+  ) +
+  guides(color = guide_legend(nrow = 2, byrow = TRUE)) +
+  theme(legend.position = "bottom")
+```
+
+
+
+# The percolation event: Reduced lexicon
+
+```{r}
+### 6. Phase Transition Analysis (The "Sweep")
+
+# A. Calculate the Sweep Data
+# We use the parameters from your "winning" model choice.
+# Ensure 'vectors' are loaded if using an embedding method.
+sweep_results <- perform_similarity_sweep(
+  corpus = corpus_signal,
+  method = "tf", # CHANGE THIS to match your winning method code (e.g. "tfidf", "bm25")
+  thresholds = seq(0.05, 1, 0.05)
+)
+
+# B. Plot the Phase Transition
+# We need to scale the "Cluster Count" to fit on the 0-1 axis for visualization,
+# then add a secondary axis labels to show the true count.
+scale_factor <- max(sweep_results$Cluster_Count, na.rm=TRUE)
+
+my_colors <- c(
+  "Giant Component Ratio (GCR)"             = "black",        # The anchor metric
+  "Modularity"                              = "firebrick3",   # High contrast
+  "Structural stress (Average betweenness)" = "royalblue4",   # Deep blue
+  "Bridge strength (Maximum betweenness)"   = "darkcyan",     # Distinct from blue
+  "Survivors (%)"                           = "darkorchid4",  # Warm but dark
+  "Cluster count"                           = "darkorange2"   # Visible orange instead of yellow
+)
+
+ggplot(sweep_results, aes(x = Threshold)) +
+  
+  # 1. Global Metrics (Solid Lines)
+  geom_line(aes(y = GCR, color = "Giant Component Ratio (GCR)"), size = 1) +
+  geom_line(aes(y = Modularity, color = "Modularity"), size = 1) +
+  geom_line(aes(y = Avg_Betweenness, color = "Structural stress (Average betweenness)"), size = 1) +
+  geom_line(aes(y = Max_Betweenness, color = "Bridge strength (Maximum betweenness)"), size = 1) +
+  
+  # 2. Survivors (Dashed Line)
+  geom_line(aes(y = Survivor_Pct, color = "Survivors (%)"), linetype = "dashed", size = 1) +
+  
+  # 3. Cluster Count (Dotted Line, Scaled)
+  geom_line(aes(y = Cluster_Count / scale_factor, color = "Cluster count"), linetype = "dotted", size = 1.2) +
+  
+  # 4. Axes & Scales
+  scale_y_continuous(
+    name = "Normalized Metrics (0-1)",
+    limits = c(0, 1),
+    # Add secondary axis for the raw cluster count
+    sec.axis = sec_axis(~ . * scale_factor, name = "Number of Clusters (Dotted)")
+  ) +
+  
+  # 5. Styling
+  scale_color_manual(values = my_colors) +
+  theme_minimal() +
+  labs(
+    title = "Network Phase Transition Sweep",
+    subtitle = "Solid = Structure; Dashed = Survivors; Dotted = Cluster count",
+    x = "Similarity Threshold",
+    color = "Metric"
+  ) +
+  guides(color = guide_legend(nrow = 2, byrow = TRUE)) +
+  theme(legend.position = "bottom")
+```
+
+
+
+
+
+
+# Selection of best model for analysis 
+
+## Full lexicon 
+
+
+```{r}
+# --- DECISION POINT ---
+# Change this string to the name of the winning model from suite_results
+# Options: "TF-IDF", "BM25", "Jaccard", "Embeddings (Wgt)"
+CHOSEN_MODEL <- "Term frequency" 
+
+message(paste(">> Selecting Winner:", CHOSEN_MODEL))
+
+# 1. Retrieve the Winner's Data
+winner <- suite_full$results[[CHOSEN_MODEL]]
+
+### 7. Cluster Intelligence Report
+
+# We inspect the specific semantic communities detected by the winning model.
+# This confirms if the mathematical "clusters" actually correspond to intelligible topics.
+
+winner$clusters %>%
+  # 1. Select Key Metrics
+  select(cluster_id, n_docs, density, conductance, mean_centrality, top_terms) %>%
+  
+  # 2. Sort by Size (Largest Topics First)
+  # arrange(desc(n_docs)) %>%
+  
+  # 3. Optional: Filter out tiny clusters (noise) if there are too many
+  filter(n_docs > 2) %>% 
+  
+  # 4. Create Table
+  gt() %>%
+  
+  # 5. Label Columns for Humans
+  cols_label(
+    cluster_id = "ID",
+    n_docs = "Size",
+    density = "Density",
+    conductance = "Conductance",
+    mean_centrality = "Cohesion",
+    top_terms = "Distinctive terms (TF-IDF)"
+  ) %>%
+  
+  # 6. Formatting
+  fmt_number(
+    columns = c(density, conductance, mean_centrality),
+    decimals = 3
+  ) %>%
+  
+  # 7. Styling
+  tab_header(
+    title = paste("Clusters ", CHOSEN_MODEL),
+    subtitle = "Semantic communities ordered by size. 'Distinctive terms' derived via localized TF-IDF."
+  ) %>%
+  
+  # Make the terms column smaller so it doesn't dominate the width
+  tab_style(
+    style = cell_text(size = "small", style = "italic"),
+    locations = cells_body(columns = top_terms)
+  ) %>%
+  
+  # Add tooltips/footnotes for the metrics
+  tab_footnote(
+    footnote = "Density: Ratio of actual connections to potential connections (Higher = tighter topic).",
+    locations = cells_column_labels(columns = density)
+  ) %>%
+  tab_footnote(
+    footnote = "Conductance: Ratio of external links to internal volume (Lower = more distinct/isolated).",
+    locations = cells_column_labels(columns = conductance)
+  )
+```
+
+
+## Reduced lexicon
+
+
+```{r}
+# --- DECISION POINT ---
+# Change this string to the name of the winning model from suite_results
+# Options: "TF-IDF", "BM25", "Jaccard", "Embeddings (Wgt)"
+CHOSEN_MODEL <- "Term frequency" 
+
+message(paste(">> Selecting Winner:", CHOSEN_MODEL))
+
+# 1. Retrieve the Winner's Data
+winner <- suite_reduced$results[[CHOSEN_MODEL]]
+
+### 7. Cluster Intelligence Report
+
+# We inspect the specific semantic communities detected by the winning model.
+# This confirms if the mathematical "clusters" actually correspond to intelligible topics.
+
+winner$clusters %>%
+  # 1. Select Key Metrics
+  select(cluster_id, n_docs, density, conductance, mean_centrality, top_terms) %>%
+  
+  # 2. Sort by Size (Largest Topics First)
+  # arrange(desc(n_docs)) %>%
+  
+  # 3. Optional: Filter out tiny clusters (noise) if there are too many
+  filter(n_docs > 2) %>% 
+  
+  # 4. Create Table
+  gt() %>%
+  
+  # 5. Label Columns for Humans
+  cols_label(
+    cluster_id = "ID",
+    n_docs = "Size",
+    density = "Density",
+    conductance = "Conductance",
+    mean_centrality = "Cohesion",
+    top_terms = "Distinctive terms (TF-IDF)"
+  ) %>%
+  
+  # 6. Formatting
+  fmt_number(
+    columns = c(density, conductance, mean_centrality),
+    decimals = 3
+  ) %>%
+  
+  # 7. Styling
+  tab_header(
+    title = paste("Clusters ", CHOSEN_MODEL),
+    subtitle = "Semantic communities ordered by size. 'Distinctive terms' derived via localized TF-IDF."
+  ) %>%
+  
+  # Make the terms column smaller so it doesn't dominate the width
+  tab_style(
+    style = cell_text(size = "small", style = "italic"),
+    locations = cells_body(columns = top_terms)
+  ) %>%
+  
+  # Add tooltips/footnotes for the metrics
+  tab_footnote(
+    footnote = "Density: Ratio of actual connections to potential connections (Higher = tighter topic).",
+    locations = cells_column_labels(columns = density)
+  ) %>%
+  tab_footnote(
+    footnote = "Conductance: Ratio of external links to internal volume (Lower = more distinct/isolated).",
+    locations = cells_column_labels(columns = conductance)
+  )
+```
+
+
