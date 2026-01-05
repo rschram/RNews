@@ -230,7 +230,7 @@ p_zipf
 suite_full <- run_model_suite(
   corpus = corpus, 
   threshold = SIM_THRESHOLD, # Defined in config.R (e.g., 0.3)
-  boot_iter = 20
+  boot_iter = 1
 )
 
 # Show the Comparison Table
@@ -293,7 +293,7 @@ suite_full$comparison %>%
 ```
 
 
-# Model comparison: Full lexicon
+# Model comparison: Reduced lexicon
 
 ```{r}
 # Run the Suite (This calls run_test_bench -> bootstrap_topology)
@@ -301,7 +301,7 @@ suite_full$comparison %>%
 suite_reduced <- run_model_suite(
   corpus = corpus_signal, 
   threshold = SIM_THRESHOLD, # Defined in config.R (e.g., 0.3)
-  boot_iter = 20
+  boot_iter = 1
 )
 
 # Show the Comparison Table
@@ -373,10 +373,10 @@ suite_reduced$comparison %>%
 # A. Calculate the Sweep Data
 # We use the parameters from your "winning" model choice.
 # Ensure 'vectors' are loaded if using an embedding method.
-sweep_results <- perform_similarity_sweep(
+sweep_results <- perform_knn_sweep(
   corpus = corpus,
-  method = "tf", # CHANGE THIS to match your winning method code (e.g. "tfidf", "bm25")
-  thresholds = seq(0.05, 1, 0.05)
+  method = "jaccard", # CHANGE THIS to match your winning method code (e.g. "tfidf", "bm25")
+  k_levels = 1:20
 )
 
 # B. Plot the Phase Transition
@@ -386,14 +386,14 @@ scale_factor <- max(sweep_results$Cluster_Count, na.rm=TRUE)
 
 my_colors <- c(
   "Giant Component Ratio (GCR)"             = "black",        # The anchor metric
-  "Modularity"                              = "firebrick3",   # High contrast
-  "Structural stress (Average betweenness)" = "royalblue4",   # Deep blue
-  "Bridge strength (Maximum betweenness)"   = "darkcyan",     # Distinct from blue
-  "Survivors (%)"                           = "darkorchid4",  # Warm but dark
+  "Modularity"                              = "yellow",   # High contrast
+  "Structural stress (Average betweenness)" = "pink",   # Deep blue
+  "Bridge strength (Maximum betweenness)"   = "cyan",     # Distinct from blue
+  "Survivors (%)"                           = "green",  # Warm but dark
   "Cluster count"                           = "darkorange2"   # Visible orange instead of yellow
 )
 
-ggplot(sweep_results, aes(x = Threshold)) +
+ggplot(sweep_results, aes(x = k)) +
   
   # 1. Global Metrics (Solid Lines)
   geom_line(aes(y = GCR, color = "Giant Component Ratio (GCR)"), size = 1) +
@@ -420,7 +420,7 @@ ggplot(sweep_results, aes(x = Threshold)) +
   labs(
     title = "Network Phase Transition Sweep",
     subtitle = "Solid = Structure; Dashed = Survivors; Dotted = Cluster count",
-    x = "Similarity Threshold",
+    x = "K (number of near nearest neighbors retained)",
     color = "Metric"
   ) +
   guides(color = guide_legend(nrow = 2, byrow = TRUE)) +
@@ -437,10 +437,10 @@ ggplot(sweep_results, aes(x = Threshold)) +
 # A. Calculate the Sweep Data
 # We use the parameters from your "winning" model choice.
 # Ensure 'vectors' are loaded if using an embedding method.
-sweep_results <- perform_similarity_sweep(
+sweep_results <- perform_knn_sweep(
   corpus = corpus_signal,
-  method = "tf", # CHANGE THIS to match your winning method code (e.g. "tfidf", "bm25")
-  thresholds = seq(0.05, 1, 0.05)
+  method = "jaccard", # CHANGE THIS to match your winning method code (e.g. "tfidf", "bm25")
+  k_levels = 1:20
 )
 
 # B. Plot the Phase Transition
@@ -457,7 +457,7 @@ my_colors <- c(
   "Cluster count"                           = "darkorange2"   # Visible orange instead of yellow
 )
 
-ggplot(sweep_results, aes(x = Threshold)) +
+ggplot(sweep_results, aes(x = k)) +
   
   # 1. Global Metrics (Solid Lines)
   geom_line(aes(y = GCR, color = "Giant Component Ratio (GCR)"), size = 1) +
@@ -478,24 +478,98 @@ ggplot(sweep_results, aes(x = Threshold)) +
     # Add secondary axis for the raw cluster count
     sec.axis = sec_axis(~ . * scale_factor, name = "Number of Clusters (Dotted)")
   ) +
-  
+  scale_x_continuous(breaks=seq(0,20,by=1)) + 
   # 5. Styling
   scale_color_manual(values = my_colors) +
   theme_minimal() +
   labs(
     title = "Network Phase Transition Sweep",
     subtitle = "Solid = Structure; Dashed = Survivors; Dotted = Cluster count",
-    x = "Similarity Threshold",
+    x = "K (number of near nearest neighbors retained)",
     color = "Metric"
   ) +
   guides(color = guide_legend(nrow = 2, byrow = TRUE)) +
   theme(legend.position = "bottom")
+
+
+```
+
+# Validated network metrics in k-NN graphs of documents
+
+## Full lexicon
+
+```{r}
+# 1. Run the Sweep
+# k=1 to k=10 is sufficient to see the phase transition and hub collapse
+sweep_results_full <- run_knn_sweep(corpus, method = "jaccard", k_levels = 1:10, n_rand = 20)
+
+# 2. Plot Small World Properties (Clustering)
+# This confirms "The Archipelago" (Observed should be much higher than Random)
+plot_knn_metric(sweep_results_full, "Transitivity", "Clustering Proof: Transitivity vs Random")
+
+# 3. Plot Global Reach (Path Length)
+# This confirms "The Highways" (Observed should be close to Random)
+plot_knn_metric(sweep_results_full, "PathLength", "Efficiency Proof: Path Length vs. Chance")
+
+# 4. Plot Disassortativity
+# This confirms "The Hubs" (Observed should be negative, Random should be near 0)
+plot_knn_metric(sweep_results_full, "Assortativity", "Structure Proof: Disassortativity vs. Random")
+
+# 4a. Table of results 
+
+get_comparison_table(sweep_results_full)
+
+# 5. Check the Sigma Score
+# The peak value indicates the optimal k for your app
+print(sweep_results_full %>% select(k, Sigma, GCR, Max_Betweenness))
+```
+
+## Reduced lexicon
+
+
+```{r}
+# 1. Run the Sweep
+# k=1 to k=10 is sufficient to see the phase transition and hub collapse
+sweep_results_red <- run_knn_sweep(corpus_signal, method = "jaccard", k_levels = 1:10, n_rand = 20)
+
+# 2. Plot Small World Properties (Clustering)
+# This confirms "The Archipelago" (Observed should be much higher than Random)
+plot_knn_metric(sweep_results_red, "Transitivity", "Clustering Proof: Transitivity vs Random")
+
+# 3. Plot Global Reach (Path Length)
+# This confirms "The Highways" (Observed should be close to Random)
+plot_knn_metric(sweep_results_red, "PathLength", "Efficiency Proof: Path Length vs. Chance")
+
+# 4. Plot Disassortativity
+# This confirms "The Hubs" (Observed should be negative, Random should be near 0)
+plot_knn_metric(sweep_results_red, "Assortativity", "Structure Proof: Disassortativity vs. Random")
+
+# 4a. Table of results 
+
+get_comparison_table(sweep_results_red)
+
+# 5. Check the Sigma Score
+# The peak value indicates the optimal k for your app
+print(sweep_results_red %>% select(k, Sigma, GCR, Max_Betweenness))
 ```
 
 
 
 
+```{r}
+# Find the "Accelerator Terms" that appear at k=3
+new_bridges <- compare_bridge_evolution(corpus, k_low = 2, k_high = 3, top_n = 200)
 
+print("Full lexicon")
+print(head(new_bridges, 376))
+
+new_bridges_red <- compare_bridge_evolution(corpus_signal, k_low = 2, k_high = 3, top_n = 200)
+
+print("Reduced lexicon")
+print(head(new_bridges_red,376))
+
+
+```
 
 # Selection of best model for analysis 
 

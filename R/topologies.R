@@ -378,3 +378,556 @@ perform_knn_sweep <- function(corpus, method = "jaccard", k_levels = 1:20) {
   
   return(bind_rows(results_list))
 }
+
+#' Extract Discursive Bridge Terms from the k=1 Percolation Skeleton
+#' 
+#' @param corpus The corpus object containing $tokens and $meta.
+#' @param method The similarity method ("jaccard" or "cosine").
+#' @param top_n Number of keystone edges to inspect for bridge terms.
+#' @return A ranked dataframe of terms that hold the 108 modules together.
+get_percolation_bridges <- function(corpus, method = "jaccard", top_n = 50) {
+  
+  message(">> Extracting Signal DTM...")
+  # Use the pre-existing document matrix logic from your suite
+  # Assuming get_document_matrix is available in your environment
+  dtm_signal <- get_document_matrix(corpus, method = method)
+  
+  message(">> Building k=1 Skeleton...")
+  # 1. Calculate Full Similarity Matrix
+  # (Crucial for identifying the single best neighbor for every doc)
+  sim_matrix <- compute_similarity(dtm_signal, method = method)
+  diag(sim_matrix) <- 0
+  
+  # 2. Build k=1 Adjacency Matrix
+  # Every row (document) gets exactly one edge to its most similar neighbor
+  adj <- matrix(0, nrow = nrow(sim_matrix), ncol = ncol(sim_matrix))
+  rownames(adj) <- rownames(sim_matrix)
+  colnames(adj) <- colnames(sim_matrix)
+  
+  for (i in 1:nrow(sim_matrix)) {
+    # If a document has no similarity to others, skip to avoid errors
+    if(max(sim_matrix[i, ]) > 0) {
+      top_index <- which.max(sim_matrix[i, ])
+      adj[i, top_index] <- sim_matrix[i, top_index]
+    }
+  }
+  
+  # 3. Create Graph and Calculate Edge Betweenness
+  # mode="max" makes it undirected; if A's best is B, they are linked.
+  g_skele <- graph_from_adjacency_matrix(adj, mode = "max", weighted = TRUE, diag = FALSE)
+  
+  message(">> Identifying Keystone Edges (Bottlenecks)...")
+  # High betweenness on a k=1 graph identifies the "trunks" connecting the modules
+  eb <- edge_betweenness(g_skele)
+  
+  # Get indices of the top N edges with the most 'stress'
+  keystone_indices <- order(eb, decreasing = TRUE)[1:min(top_n, gsize(g_skele))]
+  keystone_ends    <- ends(g_skele, keystone_indices)
+  
+  message(">> Mapping Bridges to Signal Terms...")
+  bridge_term_counts <- list()
+  
+  for(i in 1:nrow(keystone_ends)) {
+    doc_a <- keystone_ends[i, 1]
+    doc_b <- keystone_ends[i, 2]
+    
+    # Identify terms shared by the two documents connected by the keystone edge
+    # These terms are the physical 'reason' the modules are connected
+    shared_indices <- which(dtm_signal[doc_a, ] > 0 & dtm_signal[doc_b, ] > 0)
+    term_names <- colnames(dtm_signal)[shared_indices]
+    
+    for(term in term_names) {
+      bridge_term_counts[[term]] <- (bridge_term_counts[[term]] %||% 0) + 1
+    }
+  }
+  
+  # 4. Final Ranking of Bridge Terms
+  bridge_df <- data.frame(
+    Term = names(bridge_term_counts),
+    Bridge_Frequency = unlist(bridge_term_counts)
+  ) %>%
+    arrange(desc(Bridge_Frequency)) %>%
+    mutate(Relative_Strength = Bridge_Frequency / top_n)
+  
+  return(bridge_df)
+}
+
+library(igraph)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+library(igraph)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(gt) # For the nice table
+
+# --- MODULE 1: MATRIX PREPARATION ---
+#' Pre-calculate similarity matrix
+get_knn_similarity <- function(corpus, method = "jaccard") {
+  message(">> [Module 1] Computing Similarity Matrix...")
+  dtm <- get_document_matrix(corpus, method = method)
+  sim_matrix <- compute_similarity(dtm, method = ifelse(method == "jaccard", "jaccard", "cosine"))
+  diag(sim_matrix) <- 0
+  return(sim_matrix)
+}
+
+# --- MODULE 2: TOPOLOGY ENGINE (WITH Z-SCORES) ---
+analyze_topology <- function(g, n_rand = 5) {
+  
+  # Ensure undirected
+  if(is_directed(g)) g <- as.undirected(g, mode = "collapse")
+  
+  # 1. OBSERVED METRICS
+  n_nodes <- vcount(g)
+  n_edges <- ecount(g)
+  comps <- components(g)
+  gcr <- max(comps$csize) / n_nodes
+  
+  # Transitivity & Assortativity
+  trans_obs <- transitivity(g, type = "global")
+  if(is.nan(trans_obs)) trans_obs <- 0
+  
+  assort_obs <- tryCatch(assortativity_degree(g), error = function(e) NA)
+  
+  # Path Length (on Giant Component)
+  giant_indices <- which(comps$membership == which.max(comps$csize))
+  
+  if (length(giant_indices) > 10) {
+    g_giant <- induced_subgraph(g, giant_indices)
+    path_obs <- mean_distance(g_giant, directed = FALSE, weights = NA)
+    betw_max <- max(betweenness(g_giant, normalized = TRUE, directed = FALSE, weights = NA))
+  } else {
+    path_obs <- NA; betw_max <- NA
+  }
+  
+  # 2. RANDOM BASELINES (Collecting Distribution)
+  rand_stats <- data.frame(
+    trans = numeric(n_rand),
+    assort = numeric(n_rand), 
+    path = numeric(n_rand)
+  )
+  
+  if (n_rand > 0) {
+    for(i in 1:n_rand) {
+      g_rand <- sample_gnm(n = n_nodes, m = n_edges, directed = FALSE)
+      
+      # Transitivity
+      r_trans <- transitivity(g_rand, type = "global")
+      rand_stats$trans[i] <- ifelse(is.nan(r_trans), 0, r_trans)
+      
+      # Assortativity
+      rand_stats$assort[i] <- assortativity_degree(g_rand)
+      
+      # Path Length
+      r_comps <- components(g_rand)
+      r_giant_idx <- which(r_comps$membership == which.max(r_comps$csize))
+      
+      if(length(r_giant_idx) > 1) {
+        r_giant <- induced_subgraph(g_rand, r_giant_idx)
+        rand_stats$path[i] <- mean_distance(r_giant, directed = FALSE, weights = NA)
+      } else {
+        rand_stats$path[i] <- NA
+      }
+    }
+  }
+  
+  # 3. CALCULATE STATS & Z-SCORES
+  # Helper to safe-guard against SD=0 (which causes Inf Z-scores)
+  calc_z <- function(obs, values) {
+    if(is.na(obs)) return(NA)
+    mu <- mean(values, na.rm = TRUE)
+    sigma <- sd(values, na.rm = TRUE)
+    if(is.na(sigma) || sigma == 0) return(NA) # Avoid division by zero
+    return((obs - mu) / sigma)
+  }
+  
+  # Means
+  trans_rand_mean  <- mean(rand_stats$trans, na.rm=TRUE)
+  assort_rand_mean <- mean(rand_stats$assort, na.rm=TRUE)
+  path_rand_mean   <- mean(rand_stats$path, na.rm=TRUE)
+  
+  # Z-Scores
+  z_trans  <- calc_z(trans_obs, rand_stats$trans)
+  z_assort <- calc_z(assort_obs, rand_stats$assort)
+  z_path   <- calc_z(path_obs, rand_stats$path)
+  
+  # Sigma Calculation
+  t_rand_safe <- ifelse(is.na(trans_rand_mean) || trans_rand_mean == 0, 1e-9, trans_rand_mean)
+  p_rand_safe <- ifelse(is.na(path_rand_mean) || path_rand_mean == 0, 1e-9, path_rand_mean)
+  sigma_sw <- (trans_obs / t_rand_safe) / (path_obs / p_rand_safe)
+  
+  # 4. RETURN
+  return(list(
+    GCR = gcr,
+    Max_Betweenness = betw_max,
+    Sigma = sigma_sw,
+    
+    # Values
+    Transitivity = trans_obs,
+    Transitivity_Rand = trans_rand_mean,
+    Z_Transitivity = z_trans,
+    
+    Assortativity = assort_obs,
+    Assortativity_Rand = assort_rand_mean,
+    Z_Assortativity = z_assort,
+    
+    PathLength = path_obs,
+    PathLength_Rand = path_rand_mean,
+    Z_PathLength = z_path
+  ))
+}
+
+
+# --- MODULE 3: THE SWEEP ---
+run_knn_sweep <- function(corpus, method="jaccard", k_levels=1:10, n_rand=2) {
+  
+  sim_matrix <- get_knn_similarity(corpus, method)
+  total_docs <- nrow(sim_matrix)
+  
+  output_list <- list()
+  
+  message(sprintf(">> [Module 3] Starting Sweep (k=%d to %d)...", min(k_levels), max(k_levels)))
+  
+  for (k in k_levels) {
+    # Matrix Init
+    adj <- matrix(0, nrow=total_docs, ncol=total_docs)
+    rownames(adj) <- rownames(sim_matrix)
+    colnames(adj) <- colnames(sim_matrix)
+    
+    # Top-K Selection
+    for (i in 1:total_docs) {
+      top_idx <- order(sim_matrix[i, ], decreasing = TRUE)[1:k]
+      adj[i, top_idx] <- sim_matrix[i, top_idx]
+    }
+    
+    # Graph Creation
+    g_raw <- graph_from_adjacency_matrix(adj, mode="max", weighted=TRUE, diag=FALSE)
+    g <- as.undirected(g_raw, mode = "collapse")
+    
+    # Analysis
+    message(sprintf("   ... Analyzing k=%d", k))
+    metrics <- analyze_topology(g, n_rand = n_rand)
+    
+    metrics$k <- k
+    output_list[[as.character(k)]] <- as.data.frame(metrics)
+  }
+  
+  return(bind_rows(output_list))
+}
+
+# --- MODULE 4: VISUALIZATION ---
+plot_knn_metric <- function(df, metric_name, title = NULL) {
+  
+  obs_col <- metric_name
+  rand_col <- paste0(metric_name, "_Rand")
+  
+  # Check if columns exist
+  if (!all(c(obs_col, rand_col) %in% colnames(df))) {
+    stop(sprintf("Columns '%s' or '%s' not found in dataframe.", obs_col, rand_col))
+  }
+  
+  p <- ggplot(df, aes(x = k)) +
+    # Random Baseline (Dashed, Gray) - Plot first so it's behind
+    geom_line(aes_string(y = rand_col, color = "'Random'"), linetype = "dashed", size = 1) +
+    # Observed Line (Solid, Blue)
+    geom_line(aes_string(y = obs_col, color = "'Observed'"), size = 1.2) +
+    geom_point(aes_string(y = obs_col, color = "'Observed'"), size = 3) +
+    
+    theme_minimal() +
+    labs(title = ifelse(is.null(title), paste("k-NN Sweep:", metric_name), title),
+         y = metric_name, x = "k (Nearest Neighbors)") +
+    scale_color_manual(name = "Model", values = c("Observed" = "#0072B2", "Random" = "#999999")) +
+    theme(legend.position = "bottom")
+  
+  return(p)
+}
+
+# --- MODULE 5: TABLE GENERATION (WITH Z-SCORES) ---
+get_comparison_table <- function(sweep_df) {
+  sweep_df %>%
+    # Select key metrics and their Z-scores
+    select(k, Sigma, 
+           Transitivity, Z_Transitivity, 
+           Assortativity, Z_Assortativity, 
+           PathLength, Z_PathLength) %>%
+    gt() %>%
+    tab_header(
+      title = "Structural Significance Analysis",
+      subtitle = "Z-Scores indicate deviation from Random Baseline (Z > 1.96 is significant)"
+    ) %>%
+    fmt_number(columns = where(is.numeric), decimals = 3) %>%
+    fmt_number(columns = starts_with("Z_"), decimals = 1) %>% # Z-scores usually 1 decimal
+    
+    # Rename columns for space
+    cols_label(
+      Z_Transitivity = "Z (Clust)",
+      Z_Assortativity = "Z (Assort)",
+      Z_PathLength = "Z (Path)",
+      Transitivity = "Clustering"
+    ) %>%
+    
+    # 1. Color Sigma (The "Small World" Signal) - Blue intensity
+    data_color(
+      columns = c(Sigma),
+      colors = scales::col_numeric(palette = c("white", "#E6F5FF", "#0072B2"), domain = NULL)
+    ) %>%
+    
+    # 2. Color Z-Scores (Diverging: Red = Lower than random, Blue = Higher)
+    data_color(
+      columns = starts_with("Z_"),
+      colors = scales::col_bin(
+        palette = c("#D55E00", "white", "#009E73"), # Red, White, Green
+        domain = c(-100, 100), # Cap domain to prevent outliers skewing color
+        bins = c(-Inf, -1.96, 1.96, Inf) # Only color if significant
+      )
+    )
+}
+
+library(igraph)
+library(dplyr)
+
+#' Extract Bridge Terms for a specific k-NN level
+#' @param corpus The corpus object
+#' @param k The k-NN level to analyze
+#' @param top_n Number of highest-betweenness edges to inspect (default 200)
+get_knn_bridges <- function(corpus, k, top_n = 200) {
+  
+  # 1. Build the specific k-NN Graph
+  # We reuse the logic from the sweep, but for a single k
+  sim_matrix <- get_knn_similarity(corpus, method = "jaccard")
+  total_docs <- nrow(sim_matrix)
+  
+  adj <- matrix(0, nrow=total_docs, ncol=total_docs)
+  rownames(adj) <- rownames(sim_matrix); colnames(adj) <- colnames(sim_matrix)
+  
+  for (i in 1:total_docs) {
+    top_idx <- order(sim_matrix[i, ], decreasing = TRUE)[1:k]
+    adj[i, top_idx] <- sim_matrix[i, top_idx]
+  }
+  
+  g_raw <- graph_from_adjacency_matrix(adj, mode="max", weighted=TRUE, diag=FALSE)
+  g <- as.undirected(g_raw, mode = "collapse")
+  
+  # 2. Identify Keystone Edges (High Betweenness)
+  message(sprintf("   ... Calculating Edge Betweenness for k=%d (this may take a moment)", k))
+  
+  # We calculate betweenness for ALL edges to rank them accurately
+  eb <- edge_betweenness(g, directed = FALSE)
+  
+  # Select the Top N edges (the structural highways)
+  top_indices <- order(eb, decreasing = TRUE)[1:min(top_n, ecount(g))]
+  keystone_ends <- ends(g, top_indices)
+  
+  # 3. Map Edges back to Shared Terms
+  dtm <- get_document_matrix(corpus, method = "jaccard")
+  term_counts <- list()
+  
+  for(i in 1:nrow(keystone_ends)) {
+    doc_a <- keystone_ends[i, 1]
+    doc_b <- keystone_ends[i, 2]
+    
+    # Find overlapping terms between the two connected docs
+    shared_idx <- which(dtm[doc_a, ] > 0 & dtm[doc_b, ] > 0)
+    terms <- colnames(dtm)[shared_idx]
+    
+    for(t in terms) {
+      term_counts[[t]] <- (term_counts[[t]] %||% 0) + 1
+    }
+  }
+  
+  # Return sorted dataframe
+  if(length(term_counts) == 0) return(data.frame(Term=character(), Freq=numeric()))
+  
+  return(data.frame(Term = names(term_counts), Freq = unlist(term_counts)) %>% 
+           arrange(desc(Freq)))
+}
+
+#' Identify New Terms that emerge at Higher k
+#' @param corpus Corpus object
+#' @param k_low The baseline k (e.g., 2)
+#' @param k_high The target k (e.g., 3)
+compare_bridge_evolution <- function(corpus, k_low = 2, k_high = 3, top_n = 200) {
+  
+  message(sprintf(">> Comparing Bridges: k=%d vs k=%d...", k_low, k_high))
+  
+  # Get Baseline Terms
+  df_low <- get_knn_bridges(corpus, k = k_low, top_n = top_n)
+  message(sprintf("   > k=%d has %d unique bridge terms in top %d edges.", k_low, nrow(df_low), top_n))
+  
+  # Get Target Terms
+  df_high <- get_knn_bridges(corpus, k = k_high, top_n = top_n)
+  message(sprintf("   > k=%d has %d unique bridge terms in top %d edges.", k_high, nrow(df_high), top_n))
+  
+  # Find New Terms (In High but NOT in Low)
+  new_terms <- df_high %>%
+    filter(!Term %in% df_low$Term) %>%
+    rename(Freq_at_k_high = Freq) %>%
+    mutate(Relative_Strength = Freq_at_k_high / top_n) %>%
+    arrange(desc(Freq_at_k_high))
+  
+  return(new_terms)
+}
+
+library(igraph)
+library(ggraph)
+library(tidygraph)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(Matrix)
+
+#' Plot Elbow Dendrogram with Entropy-Sorted Edge Labels
+#' @param corpus The corpus object
+#' @param meta The metadata object
+#' @param filename Output filename
+plot_elbow_dendrogram_entropy <- function(corpus, meta, filename = "fiji_tree_entropy.pdf") {
+  
+  # --- 1. PREP & ENTROPY CALCULATION ---
+  message(">> Step 1: Calculating Term Entropy...")
+  
+  # Get Matrix
+  dtm <- get_document_matrix(corpus, method = "jaccard")
+  term_list <- colnames(dtm)
+  
+  # Get total frequency for each term (column sums)
+  term_sums <- colSums(dtm)
+  
+  # FIX: Normalize COLUMNS of the original DTM
+  # (N x M) %*% (M x M) = (N x M)
+  # Result: Each column t sums to 1 (Distribution of Term t across Docs)
+  P_dt <- dtm %*% Diagonal(x = 1/term_sums)
+  
+  # Calculate p * log(p)
+  # Note: 0 * log(0) is 0, so we can ignore 0 entries safely in sparse matrix
+  # We operate directly on the non-zero values (@x)
+  P_dt@x <- P_dt@x * log(P_dt@x)
+  
+  # Sum columns to get negative entropy
+  # H(t) = -sum( p(d|t) log p(d|t) )
+  term_entropy <- -1 * colSums(P_dt)
+  names(term_entropy) <- term_list
+  
+  message("   > Entropy calculated. Min: ", round(min(term_entropy),2), 
+          " | Max: ", round(max(term_entropy),2))
+  
+  # --- 2. BUILD MST ---
+  message(">> Step 2: Building MST...")
+  
+  sim_matrix <- get_knn_similarity(corpus, method = "jaccard")
+  total_docs <- nrow(sim_matrix)
+  adj <- matrix(0, nrow=total_docs, ncol=total_docs)
+  rownames(adj) <- rownames(sim_matrix); colnames(adj) <- colnames(sim_matrix)
+  
+  for (i in 1:total_docs) {
+    top_idx <- order(sim_matrix[i, ], decreasing = TRUE)[1]
+    adj[i, top_idx] <- sim_matrix[i, top_idx]
+  }
+  
+  g_raw <- graph_from_adjacency_matrix(adj, mode="max", weighted=TRUE, diag=FALSE)
+  g_undirected <- as.undirected(g_raw, mode = "collapse")
+  
+  if(components(g_undirected)$no > 1) {
+    cl <- components(g_undirected)
+    g_undirected <- induced_subgraph(g_undirected, which(cl$membership == which.max(cl$csize)))
+  }
+  
+  # --- 3. ORIENTATION & LABEL LOGIC ---
+  message(">> Step 3: Generating Labels (Ascending Entropy)...")
+  
+  ecc <- eccentricity(g_undirected)
+  root_index <- which.min(ecc)
+  bfs_res <- bfs(g_undirected, root = root_index, mode = "all", order = TRUE, father = TRUE)
+  
+  fathers_int <- as.numeric(bfs_res$father)
+  children_int <- as.numeric(bfs_res$order)
+  valid_mask <- !is.na(fathers_int[children_int])
+  
+  child_indices <- children_int[valid_mask]
+  father_indices <- fathers_int[child_indices]
+  
+  node_intersections <- vector("list", vcount(g_undirected)) 
+  edge_labels <- character(length(child_indices))
+  
+  pb <- txtProgressBar(min = 0, max = length(child_indices), style = 3)
+  
+  for(i in seq_along(child_indices)) {
+    child_idx <- child_indices[i]
+    father_idx <- father_indices[i]
+    
+    # Intersection Logic
+    row_f <- dtm[father_idx, ]
+    row_c <- dtm[child_idx, ]
+    current_intersection <- term_list[(row_f > 0) & (row_c > 0)]
+    node_intersections[[child_idx]] <- current_intersection
+    
+    prev_intersection <- node_intersections[[father_idx]]
+    
+    # Innovation Logic
+    if (is.null(prev_intersection)) {
+      innovation <- current_intersection
+    } else {
+      innovation <- setdiff(current_intersection, prev_intersection)
+    }
+    
+    candidates <- if(length(innovation) > 0) innovation else current_intersection
+    
+    if(length(candidates) > 0) {
+      # RETRIEVE ENTROPY
+      candidate_H <- term_entropy[candidates]
+      
+      # SORT ASCENDING (Lowest Entropy = Most Specific = First)
+      sorted_candidates <- names(sort(candidate_H, decreasing = FALSE))
+      
+      # Pick top 5
+      top_terms <- head(sorted_candidates, 5)
+      edge_labels[i] <- paste(top_terms, collapse = ", ")
+    } else {
+      edge_labels[i] <- ""
+    }
+    
+    if(i %% 50 == 0) setTxtProgressBar(pb, i)
+  }
+  close(pb)
+  
+  # --- 4. RENDER ---
+  message("\n>> Step 4: Rendering to PDF...")
+  
+  all_names <- V(g_undirected)$name
+  source_names <- all_names[father_indices]
+  target_names <- all_names[child_indices]
+  
+  df_edges <- data.frame(from = source_names, to = target_names, label = edge_labels)
+  g_directed <- graph_from_data_frame(df_edges, vertices = data.frame(name = all_names))
+  
+  meta_map <- setNames(meta$headline, meta$doc_id)
+  V(g_directed)$headline <- sapply(V(g_directed)$name, function(id) {
+    if(id %in% names(meta_map)) {
+      h <- gsub("\\[1 Edition\\]", "", as.character(meta_map[id]))
+      return(substr(h, 1, 60)) 
+    } else return(id)
+  })
+  
+  V(g_directed)$type <- ifelse(V(g_directed)$name == names(root_index), "ROOT", "Leaf")
+  
+  p <- ggraph(g_directed, layout = 'dendrogram', circular = FALSE) + 
+    geom_edge_elbow(aes(label = label), 
+                    color = "grey70", 
+                    width = 0.5,
+                    angle_calc = 'none',   
+                    label_dodge = unit(2, 'mm'),
+                    angle = 90,             
+                    label_size = 2,           
+                    label_colour = "blue") + 
+    geom_node_point(aes(color = type), size = 0.5) +
+    geom_node_text(aes(label = headline), 
+                   angle = 90, hjust = 1, nudge_y = -0.1, size = 2) +
+    scale_color_manual(values = c("ROOT" = "red", "Leaf" = "black")) +
+    theme_void() +
+    theme(legend.position = "none") +
+    expand_limits(y = -5)
+  
+  ggsave(filename, plot = p, width = 200, height = 40, limitsize = FALSE)
+  message(">> Done.")
+}
