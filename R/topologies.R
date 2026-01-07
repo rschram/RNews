@@ -833,11 +833,16 @@ plot_elbow_dendrogram_entropy <- function(corpus, meta, filename = "fiji_tree_en
     g_undirected <- induced_subgraph(g_undirected, which(cl$membership == which.max(cl$csize)))
   }
   
-  # --- 3. ORIENTATION & LABEL LOGIC ---
-  message(">> Step 3: Generating Labels (Ascending Entropy)...")
+  # --- 3. ORIENTATION & LABEL LOGIC (UPDATED FOR DEGREE ROOT) ---
+  message(">> Step 3: Generating Labels (Rooted by Max Degree)...")
   
-  ecc <- eccentricity(g_undirected)
-  root_index <- which.min(ecc)
+  # Calculate degree for all nodes
+  degs <- degree(g_undirected)
+  
+  # Identify the Root as the node with the highest degree (The Attractor Hub)
+  root_index <- which.max(degs)
+  
+  # Perform BFS starting from this hub to orient the tree for the dendrogram
   bfs_res <- bfs(g_undirected, root = root_index, mode = "all", order = TRUE, father = TRUE)
   
   fathers_int <- as.numeric(bfs_res$father)
@@ -930,4 +935,361 @@ plot_elbow_dendrogram_entropy <- function(corpus, meta, filename = "fiji_tree_en
   
   ggsave(filename, plot = p, width = 200, height = 40, limitsize = FALSE)
   message(">> Done.")
+}
+
+#' Diagnostic Test for 1-NN Graph Topology
+#' 
+#' @param corpus The corpus object.
+#' @param method The similarity method used (e.g., "jaccard").
+#' @return A report on the graph's structural classification.
+test_1nn_topology <- function(corpus, method = "jaccard") {
+  
+  message(">> Constructing 1-NN Graph for Diagnostic...")
+  
+  # 1. Use your existing sweep logic for k=1
+  # n_rand=0 because we only need the observed structure for this test
+  results_1nn <- run_knn_sweep(corpus, method = method, k_levels = 1, n_rand = 0)
+  
+  # 2. Re-generate the specific graph object to inspect components
+  # This mirrors the logic inside your run_knn_sweep
+  sim_matrix <- get_knn_similarity(corpus, method)
+  total_docs <- nrow(sim_matrix)
+  adj <- matrix(0, nrow=total_docs, ncol=total_docs)
+  
+  for (i in 1:total_docs) {
+    top_idx <- order(sim_matrix[i, ], decreasing = TRUE)[1]
+    adj[i, top_idx] <- sim_matrix[i, top_idx]
+  }
+  
+  g <- graph_from_adjacency_matrix(adj, mode="max", weighted=TRUE, diag=FALSE)
+  g <- as.undirected(g, mode = "collapse")
+  
+  # 3. Structural Metrics
+  n_nodes <- vcount(g)
+  n_edges <- ecount(g)
+  comps <- components(g)
+  n_components <- comps$no
+  giant_size <- max(comps$csize)
+  gcr <- giant_size / n_nodes
+  
+  # 4. Classification Logic
+  structure_type <- "Unknown"
+  if (n_components == 1) {
+    # In a connected 1-NN undirected graph, V usually equals E 
+    # because of the one mandatory cycle (reciprocal pair).
+    structure_type <- "Single Pseudo-Tree (Connected Unicyclic Graph)"
+  } else if (n_components > 1 && gcr > 0.5) {
+    structure_type <- "Fragmented Forest with a Dominant Giant Component"
+  } else {
+    structure_type <- "Highly Fragmented Pseudo-Forest"
+  }
+  
+  # 5. Output Report
+  cat("\n=== 1-NN TOPOLOGY DIAGNOSTIC ===\n")
+  cat(sprintf("Total Documents:    %d\n", n_nodes))
+  cat(sprintf("Total Edges:        %d\n", n_edges))
+  cat(sprintf("Total Components:   %d\n", n_components))
+  cat(sprintf("Giant Component:    %d (%.2f%% of corpus)\n", giant_size, gcr * 100))
+  cat(sprintf("Classification:     %s\n", structure_type))
+  cat("================================\n")
+  
+  if (n_components == 1) {
+    cat("RESULT: The corpus is a single, completely connected tree-like structure.\n")
+    cat("This confirms a global 'Universal Donor' or a continuous semantic gradient.\n")
+  } else {
+    cat(sprintf("RESULT: The corpus consists of %d disconnected 'islands'.\n", n_components))
+  }
+  
+  return(list(graph = g, components = comps, type = structure_type))
+}
+
+get_residual_2nn_links <- function(corpus, g_1nn) {
+  # Generate DTM once
+  dtm <- get_document_matrix(corpus, method = "jaccard")
+  
+  # Get the edge list using actual character names immediately
+  # This prevents the index-to-name lookup error 
+  all_edges <- as_edgelist(g_1nn, names = TRUE)
+  
+  message(">> Step 1: Identifying 1-NN Intersection Terms...")
+  
+  used_terms_mask <- logical(ncol(dtm))
+  dtm_rownames <- rownames(dtm)
+  
+  for(i in 1:nrow(all_edges)) {
+    name_a <- all_edges[i, 1]
+    name_b <- all_edges[i, 2]
+    
+    # Check if both documents exist in the DTM 
+    if (name_a %in% dtm_rownames && name_b %in% dtm_rownames) {
+      # Use drop = FALSE to keep it as a matrix/vector 
+      row_a <- dtm[name_a, , drop = FALSE]
+      row_b <- dtm[name_b, , drop = FALSE]
+      
+      # Determine shared terms (intersection)
+      # We cast to logical to ensure the mask works correctly 
+      shared_mask <- as.vector(row_a > 0 & row_b > 0)
+      used_terms_mask <- used_terms_mask | shared_mask
+    }
+  }
+  
+  # REDACT: Create the residual lexicon
+  used_terms_idx <- which(used_terms_mask)
+  dtm_residual <- dtm[, !used_terms_mask, drop = FALSE]
+  
+  # --- CRITICAL FIX: Ensure no documents are empty after redaction ---
+  # Documents with 0 terms will cause Jaccard to return NaN 
+  valid_docs <- Matrix::rowSums(dtm_residual) > 0
+  dtm_residual <- dtm_residual[valid_docs, , drop = FALSE]
+  
+  message(sprintf(">> Residual Lexicon: %d terms. Valid Docs: %d", 
+                  ncol(dtm_residual), nrow(dtm_residual)))
+  
+  # Step 2: Compute Similarity
+  sim_residual <- compute_similarity(dtm_residual, method = "jaccard")
+  diag(sim_residual) <- 0
+  
+  # Step 3: Extract Links
+  res_list <- list()
+  for(i in 1:nrow(sim_residual)) {
+    row_sims <- sim_residual[i, ]
+    
+    # Handle any remaining NaNs/NAs from the similarity calculation 
+    row_sims[is.na(row_sims) | is.nan(row_sims)] <- 0 
+    
+    if(any(row_sims > 0)) {
+      best_idx <- which.max(row_sims)
+      res_list[[i]] <- data.frame(
+        from = rownames(sim_residual)[i],
+        to = colnames(sim_residual)[best_idx],
+        weight = row_sims[best_idx],
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+  
+  return(do.call(rbind, res_list))
+}
+
+analyze_ablated_topology <- function(corpus, residual_edges, threshold = 0.05) {
+  
+  message(">> Step 1: Ablating Vocabulary (Subtracting 1-NN Terms)...")
+  
+  # 1. Setup Data Structures
+  dtm <- get_document_matrix(corpus, method = "jaccard")
+  sim_matrix <- compute_similarity(dtm, method = "jaccard")
+  diag(sim_matrix) <- 0
+  
+  # 2. Identify "Spent" Terms for every document
+  # (Terms responsible for the 1-NN link)
+  spent_masks <- list()
+  doc_indices <- 1:nrow(dtm)
+  names(doc_indices) <- rownames(dtm)
+  
+  for(i in 1:nrow(dtm)) {
+    if(max(sim_matrix[i,]) > 0) {
+      best_idx <- which.max(sim_matrix[i,])
+      # The mask is the intersection of Doc and its 1-NN Parent/Sibling
+      spent_masks[[i]] <- as.logical(dtm[i, ] & dtm[best_idx, ])
+    } else {
+      spent_masks[[i]] <- logical(ncol(dtm)) # No 1-NN, no spent terms
+    }
+  }
+  
+  # 3. Recalculate Weights for Residual Edges based on Ablated Vocab
+  message(">> Step 2: Recalculating Edge Weights...")
+  
+  ablated_edges <- residual_edges
+  new_weights <- numeric(nrow(residual_edges))
+  
+  for(k in 1:nrow(residual_edges)) {
+    id_a <- residual_edges$from[k]
+    id_b <- residual_edges$to[k]
+    
+    # Map IDs to matrix indices
+    idx_a <- doc_indices[id_a]
+    idx_b <- doc_indices[id_b]
+    
+    if(!is.na(idx_a) && !is.na(idx_b)) {
+      # Get raw binary vectors
+      vec_a <- as.logical(dtm[idx_a, ])
+      vec_b <- as.logical(dtm[idx_b, ])
+      
+      # The "Available" vocabulary for this specific pair
+      # We ignore words that A used for its 1-NN and words B used for its 1-NN
+      mask_a <- spent_masks[[idx_a]]
+      mask_b <- spent_masks[[idx_b]]
+      
+      # The strictly "Residual" Intersection
+      # (Terms shared by A and B that NEITHER used for their primary link)
+      # Note: You could argue we only exclude terms if BOTH used them, 
+      # but strict ablation says: "If this word is part of A's primary definition, 
+      # it cannot be the driver of a secondary 'latent' link."
+      valid_intersection <- (vec_a & vec_b) & (!mask_a) & (!mask_b)
+      
+      # The Union (for Jaccard) is also ablated to be fair
+      valid_union <- (vec_a | vec_b) & (!mask_a) & (!mask_b)
+      
+      if(sum(valid_union) > 0) {
+        new_weights[k] <- sum(valid_intersection) / sum(valid_union)
+      } else {
+        new_weights[k] <- 0
+      }
+    }
+  }
+  
+  ablated_edges$weight <- new_weights
+  
+  # Filter by new ablated threshold
+  final_edges <- ablated_edges[ablated_edges$weight >= threshold, ]
+  
+  message(sprintf("   > Retained %d edges after ablation and filtering (Threshold: %.3f)", 
+                  nrow(final_edges), threshold))
+  
+  if(nrow(final_edges) == 0) {
+    warning("No edges passed the ablation threshold.")
+    return(NULL)
+  }
+  
+  # 4. Build Graph
+  g_res <- graph_from_data_frame(final_edges, directed = FALSE)
+  
+  message(">> Step 3: Analyzing Topology & Small World Metrics...")
+  
+  # Focus on Giant Component for Path Length calculations
+  comps <- components(g_res)
+  g_giant <- induced_subgraph(g_res, which(comps$membership == which.max(comps$csize)))
+  
+  # METRICS
+  # C_real: Transitivity (Global Clustering Coefficient)
+  C_real <- transitivity(g_giant, type = "global")
+  if(is.na(C_real)) C_real <- 0
+  
+  # L_real: Average Path Length
+  L_real <- mean_distance(g_giant, directed = FALSE)
+  
+  # RANDOM REFERENCE (Erdos-Renyi)
+  # Generate a random graph with same Nodes and Edges
+  g_rand <- sample_gnm(n = vcount(g_giant), m = ecount(g_giant))
+  
+  C_rand <- transitivity(g_rand, type = "global")
+  if(is.na(C_rand)) C_rand <- 0
+  L_rand <- mean_distance(g_rand, directed = FALSE)
+  
+  # SIGMA (Small World Coefficient)
+  # Sigma = (C / C_rand) / (L / L_rand)
+  # > 1 implies Small World
+  sigma <- (C_real / C_rand) / (L_real / L_rand)
+  
+  message(sprintf(">> TOPOLOGY REPORT (Giant Component):"))
+  message(sprintf("   - Nodes: %d | Edges: %d", vcount(g_giant), ecount(g_giant)))
+  message(sprintf("   - Transitivity (Clustering): %.4f (Random: %.4f)", C_real, C_rand))
+  message(sprintf("   - Avg Path Length: %.4f (Random: %.4f)", L_real, L_rand))
+  message(sprintf("   - SIGMA (Small World): %.4f", sigma))
+  
+  if(sigma > 1) {
+    message("   >> RESULT: Network shows Small-World properties (Sigma > 1)")
+  } else {
+    message("   >> RESULT: Network is closer to Random or Regular Lattice (Sigma <= 1)")
+  }
+  
+  # Assortativity
+  assort <- assortativity_degree(g_giant)
+  message(sprintf("   - Degree Assortativity: %.3f", assort))
+  
+  return(g_giant)
+}
+
+get_true_residual_terms <- function(corpus, residual_edges, top_n_links = 20) {
+  
+  message(">> Step 1: Re-identifying the 'Spent' 1-NN Lexicon...")
+  
+  # 1. Re-calculate the mask of words used in the 1-NN Tree
+  # (We have to do this to know what to hide)
+  dtm <- get_document_matrix(corpus, method = "jaccard")
+  
+  # Re-build the 1-NN adjacency to find the "used" terms
+  sim_matrix <- compute_similarity(dtm, method = "jaccard")
+  diag(sim_matrix) <- 0
+  
+  used_terms_mask <- logical(ncol(dtm))
+  
+  # Iterate to mark used terms (This mimics your original logic)
+  # We do this quickly for the whole corpus
+  for(i in 1:nrow(sim_matrix)) {
+    # Find the 1-NN neighbor for doc i
+    if(max(sim_matrix[i,]) > 0) {
+      best_idx <- which.max(sim_matrix[i,])
+      # Mark the intersection as "Spent"
+      shared_mask <- as.logical(dtm[i, ] & dtm[best_idx, ])
+      used_terms_mask <- used_terms_mask | shared_mask
+    }
+  }
+  
+  message(sprintf("   > Masked %d 'Primary Topic' terms (e.g., 'the', 'said').", sum(used_terms_mask)))
+  
+  message(">> Step 2: Extracting Pure Residual Bridges...")
+  
+  # 2. Get the top residual edges
+  top_edges <- head(residual_edges[order(residual_edges$weight, decreasing = TRUE), ], top_n_links)
+  
+  results <- list()
+  
+  for(i in 1:nrow(top_edges)) {
+    doc_a <- top_edges$from[i]
+    doc_b <- top_edges$to[i]
+    
+    # Get raw rows
+    row_a <- dtm[doc_a, , drop = FALSE]
+    row_b <- dtm[doc_b, , drop = FALSE]
+    
+    # Find intersection
+    raw_intersection <- as.logical(row_a > 0 & row_b > 0)
+    
+    # CRITICAL STEP: Subtract the 'Used' mask
+    # We only want words that are SHARED but NOT USED in the 1-NN global set
+    true_residual_mask <- raw_intersection & (!used_terms_mask)
+    
+    residual_words <- colnames(dtm)[true_residual_mask]
+    
+    # Create a clean string
+    term_string <- paste(head(residual_words, 10), collapse = ", ")
+    if(length(residual_words) == 0) term_string <- "(No residual terms found? Check logic)"
+    
+    results[[i]] <- data.frame(
+      Rank = i,
+      Weight = round(top_edges$weight[i], 3),
+      Residual_Terms = term_string,
+      Count = length(residual_words)
+    )
+  }
+  
+  return(do.call(rbind, results))
+}
+
+get_lexicon_gradient <- function(corpus, g_1nn, root_id, weighted_hops = FALSE) {
+  # 1. Calculate distances from Root to all documents (BFS)
+  if (weighted_hops == TRUE) { dists <- igraph::distances(g_1nn, v = root_id, to = igraph::V(g_1nn)) } else { dists <- igraph::distances(g_1nn, v = root_id, to = igraph::V(g_1nn), weights = NA) }
+  doc_ranks <- setNames(as.vector(dists), igraph::V(g_1nn)$name)
+  
+  # 2. Map Terms to their "Birth Rank" (Minimum distance to a doc containing the term)
+  dtm <- get_document_matrix(corpus, method = "jaccard") # Sparse Binary Matrix
+  
+  # Find document indices for each term
+  # For each term (column), find the minimum doc_rank among documents where it appears
+  term_birth_ranks <- apply(dtm, 2, function(col) {
+    active_docs <- names(which(col > 0))
+    if(length(active_docs) == 0) return(NA)
+    min(doc_ranks[active_docs])
+  })
+  
+  # 3. Combine with Frequency for tie-breaking
+  term_stats <- data.frame(
+    Term = names(term_birth_ranks),
+    Birth_Rank = as.numeric(term_birth_ranks),
+    Frequency = as.numeric(Matrix::colSums(dtm))
+  ) %>%
+    arrange(Birth_Rank, desc(Frequency))
+  
+  return(term_stats)
 }
