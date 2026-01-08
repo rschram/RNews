@@ -23,8 +23,27 @@ list.files(here::here("R"), pattern = "\\.R$", full.names = TRUE) %>%
 # PHASE 1: DATA LOADING
 # ==============================================================================
 message("\n>>> PHASE 1: LOADING CORPUS")
+
+corpus_name <- "Fiji Times (2005)"
+
 DB_PATH <- file.path(PATH_PROC, "corpus_fiji_2005.sqlite")
-if(!file.exists(DB_PATH)) stop("Database not found. Run ingestion first.")
+
+if(!file.exists(DB_PATH)) { 
+  message(">> Initializing Database...")
+  in_con <- dbConnect(SQLite(), DB_PATH)
+  
+  # 1. Ingest Raw Text
+  ingest_proquest(file.path(PATH_RAW, "FT_AugSep2005.txt"), in_con, boilerplate_patterns = "<[^>]+>")
+  ingest_proquest(file.path(PATH_RAW, "FT_Oct2005.txt"), in_con, boilerplate_patterns = "<[^>]+>")
+  
+  # 2. Create Bag-of-Words Index (Old Method)
+  update_token_index(in_con, remove_stop_words = FALSE)
+  
+  # 3. Create Positional Index (New Method for Blending/Annotations)
+  update_positional_index(in_con)
+  
+  dbDisconnect(in_con)
+}
 
 con <- dbConnect(SQLite(), DB_PATH)
 meta_df <- dbGetQuery(con, "SELECT doc_id, headline, date, author FROM doc_index") %>% as_tibble()

@@ -3,7 +3,7 @@ library(tidyverse)
 library(text2vec)
 library(tidytext)
 library(Matrix)
-
+library(stringi)
 
 
 #' Ingest ProQuest Exports into SQLite (With Boilerplate Removal)
@@ -635,10 +635,10 @@ run_model_suite <- function(corpus, vectors = NULL, threshold = 0.3, boot_iter =
     "Term frequency"    = list(method = "tf", vecs = NULL),
     "TF-IDF"            = list(method = "tfidf", vecs = NULL),
     "BM25"              = list(method = "bm25",  vecs = NULL),
-    "Jaccard"           = list(method = "jaccard", vecs = NULL), 
-    "Embeddings (mean)" = list(method = "embeddings_mean", vecs = vectors),
-    "Embeddings (TF-IDF weighted)"  = list(method = "embeddings_weighted", vecs = vectors), 
-    "Soft cosine measure" = list(method = "scm", vecs = vectors)
+    "Jaccard"           = list(method = "jaccard", vecs = NULL)#, 
+    #"Embeddings (mean)" = list(method = "embeddings_mean", vecs = vectors),
+    #"Embeddings (TF-IDF weighted)"  = list(method = "embeddings_weighted", vecs = vectors), 
+    #"Soft cosine measure" = list(method = "scm", vecs = vectors)
     # Add others here if needed (Jaccard, TF, etc.)
   )
   
@@ -737,3 +737,100 @@ calc_vocab_stats <- function(dtm, similarity_threshold = 0.2) {
 }
 
 
+#' Update Positional Index (Token + Offset Tracking)
+#' 
+#' Scans the database for new documents. 
+#' Splits content into paragraphs and tokenizes each, storing strict character offsets.
+#' This table is the "Coordinate System" for annotations and highlighting.
+#' 
+#' @param db_connection DBIConnection.
+#' @export
+update_positional_index <- function(db_connection) {
+  
+  require(stringi)
+  
+  # 1. Define Schema
+  # doc_tokens: Stores the precise location of every word
+  DBI::dbExecute(db_connection, "
+    CREATE TABLE IF NOT EXISTS doc_tokens (
+      doc_id TEXT,
+      para_id INTEGER,
+      token_id INTEGER,
+      term TEXT,
+      char_start INTEGER,
+      char_end INTEGER,
+      PRIMARY KEY (doc_id, para_id, token_id),
+      FOREIGN KEY(doc_id) REFERENCES doc_index(doc_id)
+    )
+  ")
+  
+  # 2. Identify New Docs
+  message(">> Checking for new documents to index...")
+  all_ids <- DBI::dbGetQuery(db_connection, "SELECT doc_id FROM doc_content")
+  indexed_ids <- DBI::dbGetQuery(db_connection, "SELECT DISTINCT doc_id FROM doc_tokens")
+  ids_to_process <- setdiff(all_ids$doc_id, indexed_ids$doc_id)
+  
+  if(length(ids_to_process) == 0) {
+    message("   . Index is up to date.")
+    return(invisible(TRUE))
+  }
+  
+  message(paste("   + Found", length(ids_to_process), "new documents."))
+  
+  # 3. Process in Batches
+  batch_size <- 100
+  batches <- split(ids_to_process, ceiling(seq_along(ids_to_process)/batch_size))
+  
+  for(i in seq_along(batches)) {
+    batch_ids <- batches[[i]]
+    id_str <- paste0("'", batch_ids, "'", collapse = ",")
+    
+    # Fetch content
+    raw_data <- DBI::dbGetQuery(db_connection, 
+                                paste0("SELECT doc_id, full_text FROM doc_content WHERE doc_id IN (", id_str, ")"))
+    
+    # Process Batch
+    token_data_list <- list()
+    
+    for(row_idx in 1:nrow(raw_data)) {
+      curr_doc <- raw_data$doc_id[row_idx]
+      curr_text <- raw_data$full_text[row_idx]
+      
+      # A. Split into Paragraphs (Position 1 is Para 1)
+      paras <- stringi::stri_split_lines(curr_text)[[1]]
+      
+      # B. Tokenize each paragraph with offsets
+      doc_res <- lapply(seq_along(paras), function(p_idx) {
+        p_text <- paras[p_idx]
+        if(nchar(trimws(p_text)) == 0) return(NULL)
+        
+        # stri_locate_all_words gives start/end matrix
+        locs <- stringi::stri_locate_all_words(p_text)[[1]]
+        if(nrow(locs) == 0) return(NULL)
+        
+        words <- stringi::stri_sub(p_text, locs[,1], locs[,2])
+        
+        data.frame(
+          doc_id = curr_doc,
+          para_id = p_idx,
+          token_id = seq_len(nrow(locs)),
+          term = tolower(words), # Normalized for searching
+          char_start = locs[,1],
+          char_end = locs[,2]
+        )
+      })
+      
+      token_data_list[[row_idx]] <- dplyr::bind_rows(doc_res)
+    }
+    
+    # Bulk Write
+    big_df <- dplyr::bind_rows(token_data_list)
+    if(nrow(big_df) > 0) {
+      DBI::dbWriteTable(db_connection, "doc_tokens", big_df, append = TRUE)
+    }
+    message(paste("     Batch", i, "/", length(batches), "indexed."))
+  }
+  
+  message(">> Positional indexing complete.")
+  return(invisible(TRUE))
+}
